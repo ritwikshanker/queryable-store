@@ -1,5 +1,34 @@
 [project]
-name = "queryable-store"
+name = "chatmem"
 version = "0.1.0"
-requires-python = ">=3.13"
-dependencies = []
+description = "Extract structured facts about a participant from an exported chat archive, locally."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+dependencies = [
+    "typer>=0.12",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+chatmem = "chatmem.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pre-commit>=3.7",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["chatmem"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "llm: requires a live LM Studio server; skipped by default",
+]
+addopts = "-m 'not llm'"

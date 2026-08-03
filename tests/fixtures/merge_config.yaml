@@ -1,0 +1,12 @@
+# Test config declaring the cross-thread identity merge exercised by
+# tests/fixtures/synthetic_archive (Alex Rivera in thread_alpha, Alex R. in
+# thread_beta -- same person).
+target: target
+
+identities:
+  - id: target
+    display_name: Alex Rivera
+    aliases: ["Alex Rivera", "Alex R."]
+  - id: other
+    display_name: Sam Chen
+    aliases: ["Sam Chen"]

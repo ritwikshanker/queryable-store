@@ -1,0 +1,159 @@
+{
+  "_comment": "SYNTHETIC test fixture for chatmem. Handwritten; never derived from a real export. Safe to commit.",
+  "participants": [
+    {
+      "name": "Alex Rivera"
+    },
+    {
+      "name": "Sam Chen"
+    }
+  ],
+  "messages": [
+    {
+      "sender_name": "Alex Rivera",
+      "timestamp_ms": 1686710824000,
+      "is_geoblocked_for_viewer": false,
+      "is_unsent_image_by_messenger_kid_parent": false,
+      "content": "yeah just got back"
+    },
+    {
+      "sender_name": "Sam Chen",
+      "timestamp_ms": 1686710823000,
+      "is_geoblocked_for_viewer": false,
+      "is_unsent_image_by_messenger_kid_parent": false,
+      "content": "hey you around?"
+    },
+    {
+      "sender_name": "Alex Rivera",
+      "timestamp_ms": 1686700023000,
+      "is_geoblocked_for_viewer": false,
+      "is_unsent_image_by_messenger_kid_parent": false,
+      "content": "honestly I don't mind the rain, kind of relaxing"
+    },
+    {
+      "sender_name": "Alex Rivera",
+      "timestamp_ms": 1686700022000,
+      "is_geoblocked_for_viewer": false,
+      "is_unsent_image_by_messenger_kid_parent": false,
+      "content": "oh sure, hiking, my favorite thing in the world..."
+    },
+    {
+      "sender_name": "Sam Chen",
+      "timestamp_ms": 1686700021000,
+      "is_geoblocked_for_viewer": false,
+      "is_unsent_image_by_messenger_kid_parent": false,
+      "content": "I really love hiking on weekends"
+    },
+    {
+      "sender_name": "Alex Rivera",
+      "timestamp_ms": 1686700020000,
+      "is_geoblocked_for_viewer": false,
+      "is_unsent_image_by_messenger_kid_parent": false,
+      "content": "do you know any good cafes downtown?"
+    },
+    {
+      "sender_name": "Alex Rivera",
+      "timestamp_ms": 1686700019000,
+      "is_geoblocked_for_viewer": false,
+      "is_unsent_image_by_messenger_kid_parent": false,
+      "content": "if I had unlimited money I'd love to try a coffee tasting tour in Ethiopia someday"
+    },
+    {
+      "sender_name": "Alex Rivera",
+      "timestamp_ms": 1686700018000,
+      "is_geoblocked_for_viewer": false,
+      "is_unsent_image_by_messenger_kid_parent": false,
+      "content": "nah i don't like iced coffee, way too weak for me"
+    },
+    {
+      "sender_name": "Sam Chen",
+      "timestamp_ms": 1686700017000,
+      "is_geoblocked_for_viewer": false,
+      "is_unsent_image_by_messenger_kid_parent": false,
+      "content": "have you tried it iced"
+    },
+    {
+      "sender_name": "Alex Rivera",
+      "timestamp_ms": 1686700016000,
+      "is_geoblocked_for_viewer": false,
+      "is_unsent_image_by_messenger_kid_parent": false,
+      "content": "i've been drinking filter coffee every morning and i love it"
+    },
+    {
+      "sender_name": "Sam Chen",
+      "timestamp_ms": 1686700015000,
+      "is_geoblocked_for_viewer": false,
+      "is_unsent_image_by_messenger_kid_parent": false,
+      "share": {
+        "link": "https://example.com/x",
+        "share_text": "Check this out"
+      }
+    },
+    {
+      "sender_name": "Alex Rivera",
+      "timestamp_ms": 1686700014000,
+      "is_geoblocked_for_viewer": false,
+      "is_unsent_image_by_messenger_kid_parent": false,
+      "sticker": {
+        "uri": "stickers/1.webp"
+      }
+    },
+    {
+      "sender_name": "Sam Chen",
+      "timestamp_ms": 1686700013000,
+      "is_geoblocked_for_viewer": false,
+      "is_unsent_image_by_messenger_kid_parent": false,
+      "files": [
+        {
+          "uri": "files/1.pdf"
+        }
+      ]
+    },
+    {
+      "sender_name": "Alex Rivera",
+      "timestamp_ms": 1686700012000,
+      "is_geoblocked_for_viewer": false,
+      "is_unsent_image_by_messenger_kid_parent": false,
+      "gifs": [
+        {
+          "uri": "gifs/1.gif"
+        }
+      ]
+    },
+    {
+      "sender_name": "Sam Chen",
+      "timestamp_ms": 1686700011000,
+      "is_geoblocked_for_viewer": false,
+      "is_unsent_image_by_messenger_kid_parent": false,
+      "audio_files": [
+        {
+          "uri": "audio/1.m4a"
+        }
+      ]
+    },
+    {
+      "sender_name": "Alex Rivera",
+      "timestamp_ms": 1686700010000,
+      "is_geoblocked_for_viewer": false,
+      "is_unsent_image_by_messenger_kid_parent": false,
+      "videos": [
+        {
+          "uri": "videos/1.mp4"
+        }
+      ]
+    },
+    {
+      "sender_name": "Sam Chen",
+      "timestamp_ms": 1686700009000,
+      "is_geoblocked_for_viewer": false,
+      "is_unsent_image_by_messenger_kid_parent": false,
+      "photos": [
+        {
+          "uri": "photos/1.jpg"
+        }
+      ]
+    }
+  ],
+  "title": "Alex Rivera, Sam Chen",
+  "thread_path": "inbox/thread_alpha"
+}

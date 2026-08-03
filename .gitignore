@@ -162,3 +162,22 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 .idea/
 
+### chatmem
+# Never commit chat archives, derived databases, or local config.
+# Root-anchored /*.json keeps stray exports out while leaving
+# tests/fixtures/**/*.json (the committed synthetic corpus) tracked.
+data/
+*.db
+*.db-wal
+*.db-shm
+/*.json
+config.yaml
+
+# Export archives, and the directories they unpack into.
+*.zip
+*.tar.gz
+*.tgz
+/messages/
+/inbox/
+/your_instagram_activity/
+

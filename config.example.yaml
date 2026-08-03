@@ -1,0 +1,41 @@
+# chatmem configuration.
+#
+# Copy this file to config.yaml and edit it. config.yaml is gitignored — it may
+# name real people and a real database path, config.example.yaml must not.
+
+db_path: data/chatmem.db
+
+# The person whose facts get extracted, as a person id or any alias declared
+# below. Every CLI command that needs a target accepts --target to override
+# this for a single run.
+target: null
+
+# Map raw sender display names to a single person. One person may have
+# several accounts across different threads; list every display name they
+# have ever used as an alias and they will be merged under one person_id.
+# Senders not listed here are auto-created as their own person on ingest
+# (chatmem prints a warning with a paste-ready block for each one).
+#
+# identities:
+#   - id: target
+#     display_name: Participant A
+#     aliases: ["Participant A", "participant.a", "Participant A (new)"]
+#   - id: other
+#     display_name: Participant B
+#     aliases: ["Participant B"]
+identities: []
+
+llm:
+  base_url: http://localhost:1234/v1
+  api_key: lm-studio        # dummy value; LM Studio does not check it
+  chat_model: ""             # set to a chat model id served by your LM Studio instance
+  embedding_model: ""        # set to an embedding model id served by your LM Studio instance
+  timeout_seconds: 60
+  max_retries: 3
+
+sessionize:
+  idle_gap_minutes: 120
+  max_messages: 40
+
+extraction:
+  validation_pass: false

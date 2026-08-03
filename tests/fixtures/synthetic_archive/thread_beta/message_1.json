@@ -1,0 +1,50 @@
+{
+  "_comment": "SYNTHETIC test fixture for chatmem. Handwritten; never derived from a real export. Safe to commit.",
+  "participants": [
+    {
+      "name": "Alex R."
+    },
+    {
+      "name": "Sam Chen"
+    }
+  ],
+  "messages": [
+    {
+      "sender_name": "Sam Chen",
+      "timestamp_ms": 1689292004000,
+      "is_geoblocked_for_viewer": false,
+      "is_unsent_image_by_messenger_kid_parent": false,
+      "content": "oh nice"
+    },
+    {
+      "sender_name": "Alex R.",
+      "timestamp_ms": 1689292003000,
+      "is_geoblocked_for_viewer": false,
+      "is_unsent_image_by_messenger_kid_parent": false,
+      "content": "yeah! anyway I've been really into pour-over coffee lately, way better than the filter stuff"
+    },
+    {
+      "sender_name": "Sam Chen",
+      "timestamp_ms": 1689292002000,
+      "is_geoblocked_for_viewer": false,
+      "is_unsent_image_by_messenger_kid_parent": false,
+      "content": "nice, been a while"
+    },
+    {
+      "sender_name": "Alex R.",
+      "timestamp_ms": 1689292001000,
+      "is_geoblocked_for_viewer": false,
+      "is_unsent_image_by_messenger_kid_parent": false,
+      "content": "good so far, still getting used to it"
+    },
+    {
+      "sender_name": "Sam Chen",
+      "timestamp_ms": 1689292000000,
+      "is_geoblocked_for_viewer": false,
+      "is_unsent_image_by_messenger_kid_parent": false,
+      "content": "hows the new account going"
+    }
+  ],
+  "title": "Alex R., Sam Chen",
+  "thread_path": "inbox/thread_beta"
+}

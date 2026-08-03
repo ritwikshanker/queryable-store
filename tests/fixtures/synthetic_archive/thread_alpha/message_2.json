@@ -1,0 +1,92 @@
+{
+  "_comment": "SYNTHETIC test fixture for chatmem. Handwritten; never derived from a real export. Safe to commit.",
+  "participants": [
+    {
+      "name": "Alex Rivera"
+    },
+    {
+      "name": "Sam Chen"
+    }
+  ],
+  "messages": [
+    {
+      "sender_name": "Alex Rivera",
+      "timestamp_ms": 1686700008000,
+      "is_geoblocked_for_viewer": false,
+      "is_unsent_image_by_messenger_kid_parent": false,
+      "content": "actually nvm",
+      "is_unsent": true
+    },
+    {
+      "sender_name": "Sam Chen",
+      "timestamp_ms": 1686700007000,
+      "is_geoblocked_for_viewer": false,
+      "is_unsent_image_by_messenger_kid_parent": false,
+      "content": "Missed video chat"
+    },
+    {
+      "sender_name": "Sam Chen",
+      "timestamp_ms": 1686700006000,
+      "is_geoblocked_for_viewer": false,
+      "is_unsent_image_by_messenger_kid_parent": false,
+      "content": "Liked a message"
+    },
+    {
+      "sender_name": "Alex Rivera",
+      "timestamp_ms": 1686700005000,
+      "is_geoblocked_for_viewer": false,
+      "is_unsent_image_by_messenger_kid_parent": false,
+      "content": "lol same"
+    },
+    {
+      "sender_name": "Sam Chen",
+      "timestamp_ms": 1686700005000,
+      "is_geoblocked_for_viewer": false,
+      "is_unsent_image_by_messenger_kid_parent": false,
+      "content": "Then time for wakey wakey"
+    },
+    {
+      "sender_name": "Alex Rivera",
+      "timestamp_ms": 1686700004000,
+      "is_geoblocked_for_viewer": false,
+      "is_unsent_image_by_messenger_kid_parent": false,
+      "content": "For me it doesn't matter though. I can go to the lab whenever \u00f0\u009f\u0099\u008c\nGood thing about science is that you can choose which 12 hours you want to work haha \u00f0\u009f\u0098\u0082",
+      "reactions": [
+        {
+          "reaction": "\u00f0\u009f\u0098\u0082",
+          "actor": "Sam Chen"
+        }
+      ]
+    },
+    {
+      "sender_name": "Sam Chen",
+      "timestamp_ms": 1686700003000,
+      "is_geoblocked_for_viewer": false,
+      "is_unsent_image_by_messenger_kid_parent": false,
+      "content": "Yeah. I also already started working."
+    },
+    {
+      "sender_name": "Sam Chen",
+      "timestamp_ms": 1686700002000,
+      "is_geoblocked_for_viewer": false,
+      "is_unsent_image_by_messenger_kid_parent": false,
+      "is_geobloced_for_viewer": false
+    },
+    {
+      "sender_name": "Alex Rivera",
+      "timestamp_ms": 1686700001000,
+      "is_geoblocked_for_viewer": false,
+      "is_unsent_image_by_messenger_kid_parent": false,
+      "content": "Easy for you to do \u00f0\u009f\u0098\u00a4\u00f0\u009f\u0098\u00a4\nI can't be cutting worms at home \u00f0\u009f\u0098\u00ad"
+    },
+    {
+      "sender_name": "Sam Chen",
+      "timestamp_ms": 1686700000000,
+      "is_geoblocked_for_viewer": false,
+      "is_unsent_image_by_messenger_kid_parent": false,
+      "content": "Have you tried doing that at home? \u00f0\u009f\u00a4\u0094"
+    }
+  ],
+  "title": "Alex Rivera, Sam Chen",
+  "thread_path": "inbox/thread_alpha"
+}

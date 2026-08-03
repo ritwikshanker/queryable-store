@@ -15,3 +15,9 @@ def synthetic_archive() -> Path:
 def merge_config_path() -> Path:
     """Config declaring Alex Rivera / Alex R. as one person, for merge tests."""
     return FIXTURES / "merge_config.yaml"
+
+
+@pytest.fixture
+def extract_config_path() -> Path:
+    """Same identities as merge_config_path, plus llm.chat_model set."""
+    return FIXTURES / "extract_config.yaml"

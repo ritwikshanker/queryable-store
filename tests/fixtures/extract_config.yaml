@@ -1,0 +1,15 @@
+# Same identities as merge_config.yaml, plus an llm.chat_model set so
+# `chatmem extract` doesn't fail its config check. Tests still stub out the
+# actual LLM client -- no real model is ever called.
+target: target
+
+identities:
+  - id: target
+    display_name: Alex Rivera
+    aliases: ["Alex Rivera", "Alex R."]
+  - id: other
+    display_name: Sam Chen
+    aliases: ["Sam Chen"]
+
+llm:
+  chat_model: "test-model"

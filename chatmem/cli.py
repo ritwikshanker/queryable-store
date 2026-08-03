@@ -1,4 +1,4 @@
-"""chatmem CLI (Phase 1: ingest, identities, relink, stats, sessions)."""
+"""chatmem CLI: ingest, identities, relink, stats, sessions, extract."""
 
 from __future__ import annotations
 
@@ -12,7 +12,9 @@ import typer
 
 from chatmem import store
 from chatmem.config import Config, load_config
+from chatmem.extract import extract_session
 from chatmem.identity import IdentityResolver
+from chatmem.llm import LLMClient, LLMConfigError, LLMResponseError
 from chatmem.models import Message
 from chatmem.parsers import select_parser
 from chatmem.sessionize import sessionize
@@ -250,6 +252,83 @@ def sessions(
             f"  #{s.id:<5} {s.thread_id:24} seq[{s.start_seq}:{s.end_seq}] "
             f"n={s.message_count:<4} {s.start_ts} .. {s.end_ts}"
         )
+
+
+@app.command()
+def extract(
+    thread: Optional[str] = typer.Option(None, "--thread"),
+    config: Path = typer.Option(Path("config.yaml"), "--config"),
+    target: Optional[str] = typer.Option(
+        None, "--target", help="Override config.yaml's target for this run."
+    ),
+    db: Optional[Path] = typer.Option(None, "--db"),
+) -> None:
+    """Run each session the target participated in through the LLM, storing statements."""
+    cfg = _load_cfg(config, db=db, target=target)
+    if not cfg.target:
+        typer.echo(
+            "Error: no target set. Pass --target or set 'target' in config.yaml.", err=True
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        llm = LLMClient(cfg.llm)
+    except LLMConfigError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(code=1)
+
+    conn = store.connect(cfg.db_path)
+
+    target_person_id = store.resolve_person(conn, cfg.target)
+    if target_person_id is None:
+        typer.echo(
+            f"Error: target {cfg.target!r} was not found. Run `chatmem ingest` first.", err=True
+        )
+        raise typer.Exit(code=1)
+
+    display_name_by_person = {p.person_id: p.display_name for p in store.all_people(conn)}
+    target_name = display_name_by_person.get(target_person_id, target_person_id)
+
+    n_skipped = 0
+    n_failed = 0
+    n_extracted = 0
+    n_processed = 0
+
+    for session in store.list_sessions(conn, thread_id=thread):
+        participants = store.session_participant_ids(conn, session.id)
+        if target_person_id not in participants:
+            n_skipped += 1
+            continue
+
+        messages = store.session_messages(
+            conn, session.thread_id, session.start_seq, session.end_seq
+        )
+        try:
+            statements = extract_session(
+                session,
+                messages,
+                target_person_id,
+                target_name,
+                llm,
+                display_name_by_person,
+                validation_pass=cfg.extraction.validation_pass,
+            )
+        except LLMResponseError as e:
+            typer.echo(f"Warning: session #{session.id} failed: {e}")
+            n_failed += 1
+            continue
+
+        store.replace_session_statements(conn, session.id, statements)
+        n_processed += 1
+        n_extracted += len(statements)
+
+    conn.commit()
+
+    typer.echo(
+        f"sessions:   {n_processed} processed, {n_skipped} skipped (target absent), "
+        f"{n_failed} failed"
+    )
+    typer.echo(f"statements: {n_extracted} extracted")
 
 
 if __name__ == "__main__":

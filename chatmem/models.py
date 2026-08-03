@@ -69,3 +69,23 @@ class Session:
     start_ts: str
     end_ts: str
     message_count: int
+
+
+@dataclass(frozen=True)
+class Statement:
+    """A self-statement the target made, extracted from one session.
+
+    start_ts/end_ts are the min/max timestamp among source_message_ids (or
+    the session's own bounds if the LLM cited nothing) -- the citation shown
+    back to the user.
+    """
+
+    id: int | None
+    person_id: str
+    session_id: int
+    thread_id: str
+    text: str
+    source_message_ids: list[str]
+    start_ts: str
+    end_ts: str
+    created_at: str

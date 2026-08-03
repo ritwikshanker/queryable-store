@@ -8,13 +8,15 @@ which rows get dropped between runs.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
 from chatmem.identity import IdentityResolver
-from chatmem.models import Message, Person, Session
+from chatmem.models import Message, Person, Session, Statement
+from chatmem.parsers.text import normalize_alias
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA_SQL = """
 CREATE TABLE people (
@@ -73,7 +75,42 @@ CREATE TABLE meta (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+
+CREATE TABLE statements (
+    id                 INTEGER PRIMARY KEY,
+    person_id          TEXT NOT NULL REFERENCES people(person_id),
+    session_id         INTEGER NOT NULL REFERENCES sessions(id),
+    thread_id          TEXT NOT NULL REFERENCES threads(thread_id),
+    text               TEXT NOT NULL,
+    source_message_ids TEXT NOT NULL,  -- JSON list of messages.id
+    start_ts           TEXT NOT NULL,
+    end_ts             TEXT NOT NULL,
+    created_at         TEXT NOT NULL
+);
+CREATE INDEX statements_person ON statements(person_id);
+CREATE INDEX statements_session ON statements(session_id);
 """
+
+# Migrations applied in order to bring an existing DB from one
+# schema_version to the next, so Phase-1 databases keep working without a
+# re-ingest. Each entry upgrades from its key to key+1.
+_MIGRATIONS: dict[int, str] = {
+    1: """
+    CREATE TABLE statements (
+        id                 INTEGER PRIMARY KEY,
+        person_id          TEXT NOT NULL REFERENCES people(person_id),
+        session_id         INTEGER NOT NULL REFERENCES sessions(id),
+        thread_id          TEXT NOT NULL REFERENCES threads(thread_id),
+        text               TEXT NOT NULL,
+        source_message_ids TEXT NOT NULL,
+        start_ts           TEXT NOT NULL,
+        end_ts             TEXT NOT NULL,
+        created_at         TEXT NOT NULL
+    );
+    CREATE INDEX statements_person ON statements(person_id);
+    CREATE INDEX statements_session ON statements(session_id);
+    """,
+}
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -97,8 +134,17 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             (str(SCHEMA_VERSION),),
         )
         conn.commit()
-    # No migrations yet; schema_version is here so Phase 2+ can add them
-    # without breaking databases created by this version.
+        return
+
+    row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+    version = int(row["value"]) if row else 1
+    while version < SCHEMA_VERSION:
+        conn.executescript(_MIGRATIONS[version])
+        version += 1
+        conn.execute(
+            "UPDATE meta SET value = ? WHERE key = 'schema_version'", (str(version),)
+        )
+    conn.commit()
 
 
 # --- identity ----------------------------------------------------------
@@ -142,6 +188,22 @@ def all_people(conn: sqlite3.Connection) -> list[Person]:
     return [Person(person_id=r["person_id"], display_name=r["display_name"], origin=r["origin"]) for r in rows]
 
 
+def resolve_person(conn: sqlite3.Connection, value: str) -> str | None:
+    """Resolve a person_id or alias against already-ingested data.
+
+    Used by commands (like `extract`) that run after `ingest` and need
+    config.yaml's `target` resolved without re-parsing the source archive or
+    rebuilding an IdentityResolver.
+    """
+    row = conn.execute("SELECT person_id FROM people WHERE person_id = ?", (value,)).fetchone()
+    if row is not None:
+        return row["person_id"]
+    row = conn.execute(
+        "SELECT person_id FROM aliases WHERE alias_norm = ?", (normalize_alias(value),)
+    ).fetchone()
+    return row["person_id"] if row is not None else None
+
+
 # --- threads / messages --------------------------------------------------
 
 
@@ -153,8 +215,6 @@ def upsert_thread(
     source: str,
     ingested_at: str,
 ) -> None:
-    import json
-
     conn.execute(
         "INSERT INTO threads (thread_id, title, participants, source, ingested_at) "
         "VALUES (?, ?, ?, ?, ?) "
@@ -298,6 +358,106 @@ def list_sessions(
             start_ts=r["start_ts"],
             end_ts=r["end_ts"],
             message_count=r["message_count"],
+        )
+        for r in rows
+    ]
+
+
+def session_participant_ids(conn: sqlite3.Connection, session_id: int) -> set[str]:
+    rows = conn.execute(
+        "SELECT person_id FROM session_participants WHERE session_id = ?", (session_id,)
+    ).fetchall()
+    return {r["person_id"] for r in rows}
+
+
+def session_messages(conn: sqlite3.Connection, thread_id: str, start_seq: int, end_seq: int) -> list[Message]:
+    rows = conn.execute(
+        "SELECT id, thread_id, sender, person_id, timestamp_utc, timestamp_ms, text, "
+        "media_type, seq FROM messages WHERE thread_id = ? AND seq BETWEEN ? AND ? "
+        "ORDER BY seq ASC",
+        (thread_id, start_seq, end_seq),
+    ).fetchall()
+    return [
+        Message(
+            id=r["id"],
+            thread_id=r["thread_id"],
+            sender=r["sender"],
+            person_id=r["person_id"],
+            timestamp_utc=r["timestamp_utc"],
+            timestamp_ms=r["timestamp_ms"],
+            text=r["text"],
+            media_type=r["media_type"],
+            seq=r["seq"],
+        )
+        for r in rows
+    ]
+
+
+# --- statements ----------------------------------------------------------
+
+
+def replace_session_statements(
+    conn: sqlite3.Connection, session_id: int, statements: list[Statement]
+) -> None:
+    """Delete and rebuild a session's statements, matching the delete-then-insert
+    pattern used for messages and sessions, so re-running extract is idempotent."""
+    conn.execute("DELETE FROM statements WHERE session_id = ?", (session_id,))
+    conn.executemany(
+        "INSERT INTO statements "
+        "(person_id, session_id, thread_id, text, source_message_ids, start_ts, end_ts, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            (
+                s.person_id,
+                s.session_id,
+                s.thread_id,
+                s.text,
+                json.dumps(s.source_message_ids),
+                s.start_ts,
+                s.end_ts,
+                s.created_at,
+            )
+            for s in statements
+        ],
+    )
+
+
+def list_statements(
+    conn: sqlite3.Connection,
+    person_id: str | None = None,
+    thread_id: str | None = None,
+    limit: int | None = None,
+) -> list[Statement]:
+    sql = (
+        "SELECT id, person_id, session_id, thread_id, text, source_message_ids, "
+        "start_ts, end_ts, created_at FROM statements"
+    )
+    clauses = []
+    params: list[object] = []
+    if person_id is not None:
+        clauses.append("person_id = ?")
+        params.append(person_id)
+    if thread_id is not None:
+        clauses.append("thread_id = ?")
+        params.append(thread_id)
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY start_ts ASC"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    rows = conn.execute(sql, params).fetchall()
+    return [
+        Statement(
+            id=r["id"],
+            person_id=r["person_id"],
+            session_id=r["session_id"],
+            thread_id=r["thread_id"],
+            text=r["text"],
+            source_message_ids=json.loads(r["source_message_ids"]),
+            start_ts=r["start_ts"],
+            end_ts=r["end_ts"],
+            created_at=r["created_at"],
         )
         for r in rows
     ]

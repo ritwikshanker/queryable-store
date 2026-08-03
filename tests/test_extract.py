@@ -42,6 +42,10 @@ class FakeLLM:
     def validate_statements(self, transcript, target_name, statements):
         return self._supported
 
+    def embed(self, text):
+        # Deterministic and distinct per input, just enough to assert on.
+        return [float(len(text))]
+
 
 def test_build_transcript_numbers_lines_and_labels_media():
     messages = [
@@ -78,6 +82,7 @@ def test_extract_session_maps_citations_to_messages():
     assert s.person_id == "target"
     assert s.session_id == 1
     assert s.thread_id == "t1"
+    assert s.embedding == [float(len("Works as a nurse in Chicago"))]
 
 
 def test_extract_session_falls_back_to_session_bounds_when_no_citation():

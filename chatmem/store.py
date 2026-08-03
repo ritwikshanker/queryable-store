@@ -16,7 +16,7 @@ from chatmem.identity import IdentityResolver
 from chatmem.models import Message, Person, Session, Statement
 from chatmem.parsers.text import normalize_alias
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA_SQL = """
 CREATE TABLE people (
@@ -85,14 +85,15 @@ CREATE TABLE statements (
     source_message_ids TEXT NOT NULL,  -- JSON list of messages.id
     start_ts           TEXT NOT NULL,
     end_ts             TEXT NOT NULL,
-    created_at         TEXT NOT NULL
+    created_at         TEXT NOT NULL,
+    embedding          TEXT  -- JSON list of floats; NULL until embedded
 );
 CREATE INDEX statements_person ON statements(person_id);
 CREATE INDEX statements_session ON statements(session_id);
 """
 
 # Migrations applied in order to bring an existing DB from one
-# schema_version to the next, so Phase-1 databases keep working without a
+# schema_version to the next, so older databases keep working without a
 # re-ingest. Each entry upgrades from its key to key+1.
 _MIGRATIONS: dict[int, str] = {
     1: """
@@ -110,6 +111,7 @@ _MIGRATIONS: dict[int, str] = {
     CREATE INDEX statements_person ON statements(person_id);
     CREATE INDEX statements_session ON statements(session_id);
     """,
+    2: "ALTER TABLE statements ADD COLUMN embedding TEXT;",
 }
 
 
@@ -404,8 +406,9 @@ def replace_session_statements(
     conn.execute("DELETE FROM statements WHERE session_id = ?", (session_id,))
     conn.executemany(
         "INSERT INTO statements "
-        "(person_id, session_id, thread_id, text, source_message_ids, start_ts, end_ts, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "(person_id, session_id, thread_id, text, source_message_ids, start_ts, end_ts, "
+        "created_at, embedding) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
             (
                 s.person_id,
@@ -416,6 +419,7 @@ def replace_session_statements(
                 s.start_ts,
                 s.end_ts,
                 s.created_at,
+                json.dumps(s.embedding) if s.embedding is not None else None,
             )
             for s in statements
         ],
@@ -430,7 +434,7 @@ def list_statements(
 ) -> list[Statement]:
     sql = (
         "SELECT id, person_id, session_id, thread_id, text, source_message_ids, "
-        "start_ts, end_ts, created_at FROM statements"
+        "start_ts, end_ts, created_at, embedding FROM statements"
     )
     clauses = []
     params: list[object] = []
@@ -458,9 +462,38 @@ def list_statements(
             start_ts=r["start_ts"],
             end_ts=r["end_ts"],
             created_at=r["created_at"],
+            embedding=json.loads(r["embedding"]) if r["embedding"] is not None else None,
         )
         for r in rows
     ]
+
+
+def messages_by_ids(conn: sqlite3.Connection, message_ids: list[str]) -> list[Message]:
+    """Fetch messages by id, in the given order -- used to quote a statement's
+    source messages back for `chatmem query`."""
+    if not message_ids:
+        return []
+    placeholders = ",".join("?" for _ in message_ids)
+    rows = conn.execute(
+        "SELECT id, thread_id, sender, person_id, timestamp_utc, timestamp_ms, text, "
+        f"media_type, seq FROM messages WHERE id IN ({placeholders})",
+        message_ids,
+    ).fetchall()
+    by_id = {
+        r["id"]: Message(
+            id=r["id"],
+            thread_id=r["thread_id"],
+            sender=r["sender"],
+            person_id=r["person_id"],
+            timestamp_utc=r["timestamp_utc"],
+            timestamp_ms=r["timestamp_ms"],
+            text=r["text"],
+            media_type=r["media_type"],
+            seq=r["seq"],
+        )
+        for r in rows
+    }
+    return [by_id[mid] for mid in message_ids if mid in by_id]
 
 
 # --- stats -------------------------------------------------------------

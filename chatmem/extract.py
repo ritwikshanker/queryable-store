@@ -95,6 +95,7 @@ def extract_session(
                 source_message_ids=source_ids,
                 start_ts=start_ts,
                 end_ts=end_ts,
+                embedding=llm.embed(text),
                 created_at=created_at,
             )
         )

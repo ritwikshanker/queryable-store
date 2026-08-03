@@ -68,6 +68,41 @@ def test_connect_migrates_v1_db_without_dropping_data(tmp_path):
     conn.execute("SELECT COUNT(*) FROM statements")
 
 
+def test_connect_migrates_v2_db_adding_embedding_column(tmp_path):
+    import sqlite3
+
+    db_path = tmp_path / "chatmem.db"
+    # A Phase-2 (schema_version=2) database: statements table exists, but
+    # without the embedding column Phase 3 adds.
+    v2_conn = sqlite3.connect(str(db_path))
+    v2_conn.executescript(
+        """
+        CREATE TABLE people (person_id TEXT PRIMARY KEY, display_name TEXT NOT NULL, origin TEXT NOT NULL);
+        CREATE TABLE aliases (alias_norm TEXT PRIMARY KEY, raw_name TEXT NOT NULL, person_id TEXT NOT NULL);
+        CREATE TABLE threads (thread_id TEXT PRIMARY KEY, title TEXT, participants TEXT, source TEXT NOT NULL, ingested_at TEXT NOT NULL);
+        CREATE TABLE messages (id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, sender TEXT NOT NULL, person_id TEXT NOT NULL, timestamp_utc TEXT NOT NULL, timestamp_ms INTEGER NOT NULL, text TEXT, media_type TEXT, seq INTEGER NOT NULL);
+        CREATE TABLE sessions (id INTEGER PRIMARY KEY, thread_id TEXT NOT NULL, start_seq INTEGER NOT NULL, end_seq INTEGER NOT NULL, start_ts TEXT NOT NULL, end_ts TEXT NOT NULL, message_count INTEGER NOT NULL);
+        CREATE TABLE session_participants (session_id INTEGER NOT NULL, person_id TEXT NOT NULL, PRIMARY KEY (session_id, person_id));
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE statements (id INTEGER PRIMARY KEY, person_id TEXT NOT NULL, session_id INTEGER NOT NULL, thread_id TEXT NOT NULL, text TEXT NOT NULL, source_message_ids TEXT NOT NULL, start_ts TEXT NOT NULL, end_ts TEXT NOT NULL, created_at TEXT NOT NULL);
+        INSERT INTO meta (key, value) VALUES ('schema_version', '2');
+        INSERT INTO people (person_id, display_name, origin) VALUES ('pA', 'A', 'auto');
+        INSERT INTO statements (person_id, session_id, thread_id, text, source_message_ids, start_ts, end_ts, created_at)
+            VALUES ('pA', 1, 't1', 'hi', '[]', '1970-01-01T00:00:00.000000Z', '1970-01-01T00:00:00.000000Z', '1970-01-01T00:00:00.000000Z');
+        """
+    )
+    v2_conn.commit()
+    v2_conn.close()
+
+    conn = store.connect(db_path)
+    row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+    assert row["value"] == str(store.SCHEMA_VERSION)
+    # Existing statement survived the migration, with embedding NULL.
+    stmt_row = conn.execute("SELECT text, embedding FROM statements").fetchone()
+    assert stmt_row["text"] == "hi"
+    assert stmt_row["embedding"] is None
+
+
 def test_thread_and_message_round_trip(tmp_path):
     conn = store.connect(tmp_path / "chatmem.db")
     store.upsert_thread(conn, "t1", "Title", ["A", "B"], "instagram", "2024-01-01T00:00:00Z")
@@ -149,7 +184,7 @@ def test_sessions_round_trip_with_participants(tmp_path):
     assert listed[0].start_seq == 0 and listed[0].end_seq == 2
 
 
-def _statement(session_id, person_id="pA", thread_id="t1", text="hi", source_ids=None):
+def _statement(session_id, person_id="pA", thread_id="t1", text="hi", source_ids=None, embedding=None):
     from chatmem.models import Statement
 
     return Statement(
@@ -162,6 +197,7 @@ def _statement(session_id, person_id="pA", thread_id="t1", text="hi", source_ids
         start_ts="1970-01-01T00:00:00.000000Z",
         end_ts="1970-01-01T00:00:01.000000Z",
         created_at="1970-01-01T00:00:02.000000Z",
+        embedding=embedding,
     )
 
 
@@ -189,6 +225,46 @@ def test_replace_session_statements_round_trip_and_replace(tmp_path):
     loaded = store.list_statements(conn, person_id="pA")
     assert len(loaded) == 1
     assert loaded[0].text == "v2"
+
+
+def test_statement_embedding_round_trips_and_defaults_to_none(tmp_path):
+    conn = store.connect(tmp_path / "chatmem.db")
+    store.upsert_thread(conn, "t1", None, [], "instagram", "2024-01-01T00:00:00Z")
+    _ensure_people(conn, "pA")
+    msgs = [_msg("id0", "t1", "A", "pA", 0, 0)]
+    store.replace_thread_messages(conn, "t1", msgs)
+    by_seq = {m.seq: m for m in msgs}
+    [session] = store.replace_thread_sessions(conn, "t1", [(0, 0)], by_seq)
+    conn.commit()
+
+    store.replace_session_statements(
+        conn, session.id, [_statement(session.id, text="no embedding")]
+    )
+    conn.commit()
+    assert store.list_statements(conn, person_id="pA")[0].embedding is None
+
+    store.replace_session_statements(
+        conn, session.id, [_statement(session.id, text="embedded", embedding=[0.1, 0.2, 0.3])]
+    )
+    conn.commit()
+    assert store.list_statements(conn, person_id="pA")[0].embedding == [0.1, 0.2, 0.3]
+
+
+def test_messages_by_ids_preserves_order_and_skips_missing(tmp_path):
+    conn = store.connect(tmp_path / "chatmem.db")
+    store.upsert_thread(conn, "t1", None, [], "instagram", "2024-01-01T00:00:00Z")
+    _ensure_people(conn, "pA")
+    msgs = [
+        _msg("id0", "t1", "A", "pA", 0, 0, text="first"),
+        _msg("id1", "t1", "A", "pA", 1, 1, text="second"),
+    ]
+    store.replace_thread_messages(conn, "t1", msgs)
+    conn.commit()
+
+    loaded = store.messages_by_ids(conn, ["id1", "missing", "id0"])
+    assert [m.text for m in loaded] == ["second", "first"]
+
+    assert store.messages_by_ids(conn, []) == []
 
 
 def test_resolve_person_by_id_and_alias(tmp_path):

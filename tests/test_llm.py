@@ -10,27 +10,68 @@ from chatmem.llm import LLMClient, LLMConfigError, LLMResponseError
 class FakeClient:
     """Stands in for openai.OpenAI(): records calls, replays scripted responses."""
 
-    def __init__(self, responses: list[str]):
-        self._responses = list(responses)
+    def __init__(self, responses: list[str] | None = None, embeddings: list[list[float]] | None = None):
+        self._responses = list(responses or [])
+        self._embeddings = list(embeddings or [])
         self.calls: list[dict] = []
+        self.embedding_calls: list[dict] = []
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+        self.embeddings = SimpleNamespace(create=self._embed)
 
     def _create(self, **kwargs):
         self.calls.append(kwargs)
         content = self._responses.pop(0)
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
 
+    def _embed(self, **kwargs):
+        self.embedding_calls.append(kwargs)
+        vector = self._embeddings.pop(0)
+        return SimpleNamespace(data=[SimpleNamespace(embedding=vector)])
+
 
 def _client(monkeypatch, responses: list[str], max_retries: int = 3) -> tuple[LLMClient, FakeClient]:
-    fake = FakeClient(responses)
+    fake = FakeClient(responses=responses)
     monkeypatch.setattr(llm_module, "OpenAI", lambda **kwargs: fake)
     cfg = LLMConfig(chat_model="test-model", max_retries=max_retries)
     return LLMClient(cfg), fake
 
 
-def test_missing_chat_model_raises_config_error():
+def test_construction_does_not_require_any_model_id(monkeypatch):
+    """LLMClient is used for chat-only (extract) and embedding-only (query)
+    work, so __init__ shouldn't demand both up front."""
+    monkeypatch.setattr(llm_module, "OpenAI", lambda **kwargs: FakeClient())
+    LLMClient(LLMConfig(chat_model="", embedding_model=""))  # must not raise
+
+
+def test_extract_statements_raises_config_error_when_chat_model_unset(monkeypatch):
+    monkeypatch.setattr(llm_module, "OpenAI", lambda **kwargs: FakeClient())
+    client = LLMClient(LLMConfig(chat_model=""))
     with pytest.raises(LLMConfigError):
-        LLMClient(LLMConfig(chat_model=""))
+        client.extract_statements("t", "Alex")
+
+
+def test_validate_statements_raises_config_error_when_chat_model_unset(monkeypatch):
+    monkeypatch.setattr(llm_module, "OpenAI", lambda **kwargs: FakeClient())
+    client = LLMClient(LLMConfig(chat_model=""))
+    with pytest.raises(LLMConfigError):
+        client.validate_statements("t", "Alex", ["a"])
+
+
+def test_embed_raises_config_error_when_embedding_model_unset(monkeypatch):
+    monkeypatch.setattr(llm_module, "OpenAI", lambda **kwargs: FakeClient())
+    client = LLMClient(LLMConfig(chat_model="test-model", embedding_model=""))
+    with pytest.raises(LLMConfigError):
+        client.embed("some text")
+
+
+def test_embed_returns_vector_from_response(monkeypatch):
+    fake = FakeClient(embeddings=[[0.1, 0.2, 0.3]])
+    monkeypatch.setattr(llm_module, "OpenAI", lambda **kwargs: fake)
+    client = LLMClient(LLMConfig(chat_model="test-model", embedding_model="test-embed-model"))
+    result = client.embed("some text")
+    assert result == [0.1, 0.2, 0.3]
+    assert fake.embedding_calls[0]["model"] == "test-embed-model"
+    assert fake.embedding_calls[0]["input"] == "some text"
 
 
 def test_extract_statements_parses_valid_json(monkeypatch):

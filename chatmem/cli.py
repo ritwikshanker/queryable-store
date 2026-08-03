@@ -1,4 +1,4 @@
-"""chatmem CLI: ingest, identities, relink, stats, sessions, extract."""
+"""chatmem CLI: ingest, identities, relink, stats, sessions, extract, query."""
 
 from __future__ import annotations
 
@@ -14,9 +14,10 @@ from chatmem import store
 from chatmem.config import Config, load_config
 from chatmem.extract import extract_session
 from chatmem.identity import IdentityResolver
-from chatmem.llm import LLMClient, LLMConfigError, LLMResponseError
+from chatmem.llm import LLMClient, LLMResponseError
 from chatmem.models import Message
 from chatmem.parsers import select_parser
+from chatmem.query import query as run_query
 from chatmem.sessionize import sessionize
 
 app = typer.Typer(
@@ -270,13 +271,18 @@ def extract(
             "Error: no target set. Pass --target or set 'target' in config.yaml.", err=True
         )
         raise typer.Exit(code=1)
-
-    try:
-        llm = LLMClient(cfg.llm)
-    except LLMConfigError as e:
-        typer.echo(f"Error: {e}", err=True)
+    if not cfg.llm.chat_model:
+        typer.echo("Error: llm.chat_model is not set in config.yaml.", err=True)
+        raise typer.Exit(code=1)
+    if not cfg.llm.embedding_model:
+        typer.echo(
+            "Error: llm.embedding_model is not set in config.yaml -- required to embed "
+            "extracted statements for `chatmem query`.",
+            err=True,
+        )
         raise typer.Exit(code=1)
 
+    llm = LLMClient(cfg.llm)
     conn = store.connect(cfg.db_path)
 
     target_person_id = store.resolve_person(conn, cfg.target)
@@ -329,6 +335,57 @@ def extract(
         f"{n_failed} failed"
     )
     typer.echo(f"statements: {n_extracted} extracted")
+
+
+@app.command()
+def query(
+    question: str = typer.Argument(..., help="A natural-language question about the target."),
+    limit: int = typer.Option(5, "--limit"),
+    config: Path = typer.Option(Path("config.yaml"), "--config"),
+    target: Optional[str] = typer.Option(
+        None, "--target", help="Override config.yaml's target for this run."
+    ),
+    db: Optional[Path] = typer.Option(None, "--db"),
+) -> None:
+    """Semantically search the target's extracted statements, with citations."""
+    cfg = _load_cfg(config, db=db, target=target)
+    if not cfg.target:
+        typer.echo(
+            "Error: no target set. Pass --target or set 'target' in config.yaml.", err=True
+        )
+        raise typer.Exit(code=1)
+    if not cfg.llm.embedding_model:
+        typer.echo("Error: llm.embedding_model is not set in config.yaml.", err=True)
+        raise typer.Exit(code=1)
+
+    conn = store.connect(cfg.db_path)
+
+    target_person_id = store.resolve_person(conn, cfg.target)
+    if target_person_id is None:
+        typer.echo(
+            f"Error: target {cfg.target!r} was not found. Run `chatmem ingest` first.", err=True
+        )
+        raise typer.Exit(code=1)
+
+    statements = store.list_statements(conn, person_id=target_person_id)
+    embedded = [s for s in statements if s.embedding is not None]
+    if not embedded:
+        typer.echo("No embedded statements found. Run `chatmem extract` first.")
+        raise typer.Exit(code=0)
+
+    llm = LLMClient(cfg.llm)
+    results = run_query(question, embedded, llm, limit=limit)
+
+    if not results:
+        typer.echo("No matching statements found.")
+        return
+
+    for statement, score in results:
+        typer.echo(f"[{score:.3f}] {statement.text}")
+        typer.echo(f"    {statement.thread_id}  {statement.start_ts} .. {statement.end_ts}")
+        for m in store.messages_by_ids(conn, statement.source_message_ids):
+            typer.echo(f"    > {m.sender}: {m.text}")
+        typer.echo("")
 
 
 if __name__ == "__main__":

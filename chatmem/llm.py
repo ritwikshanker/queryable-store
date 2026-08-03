@@ -14,7 +14,7 @@ from chatmem.prompts import validate as validate_prompt
 
 
 class LLMConfigError(ValueError):
-    """Raised when llm.chat_model is not set in config.yaml."""
+    """Raised when a needed model id (chat_model or embedding_model) is not set."""
 
 
 class LLMResponseError(RuntimeError):
@@ -23,12 +23,13 @@ class LLMResponseError(RuntimeError):
 
 
 class LLMClient:
+    """Not every caller needs every model: `chatmem extract` needs chat_model
+    (and embedding_model, to embed what it extracts); `chatmem query` only
+    needs embedding_model. So config validation happens per-capability in
+    _chat_json/embed, not eagerly in __init__.
+    """
+
     def __init__(self, config: LLMConfig):
-        if not config.chat_model:
-            raise LLMConfigError(
-                "llm.chat_model is not set in config.yaml -- set it to a chat model id "
-                "served by your LM Studio instance."
-            )
         self._config = config
         self._client = OpenAI(
             base_url=config.base_url,
@@ -37,6 +38,11 @@ class LLMClient:
         )
 
     def _chat_json(self, system_prompt: str, user_message: str) -> dict:
+        if not self._config.chat_model:
+            raise LLMConfigError(
+                "llm.chat_model is not set in config.yaml -- set it to a chat model id "
+                "served by your LM Studio instance."
+            )
         last_error: Exception | None = None
         for _ in range(max(1, self._config.max_retries)):
             response = self._client.chat.completions.create(
@@ -79,3 +85,12 @@ class LLMClient:
             if isinstance(r, dict) and "index" in r and "supported" in r
         }
         return [supported_by_index.get(i, False) for i in range(len(statements))]
+
+    def embed(self, text: str) -> list[float]:
+        if not self._config.embedding_model:
+            raise LLMConfigError(
+                "llm.embedding_model is not set in config.yaml -- set it to an embedding "
+                "model id served by your LM Studio instance."
+            )
+        response = self._client.embeddings.create(model=self._config.embedding_model, input=text)
+        return list(response.data[0].embedding)

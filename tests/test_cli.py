@@ -22,6 +22,12 @@ class _FakeLLM:
     def validate_statements(self, transcript, target_name, statements):
         return [True for _ in statements]
 
+    def embed(self, text):
+        # Constant vector: every statement scores identically against any
+        # query, which is fine here -- ranking itself is covered by
+        # tests/test_query.py. These tests only check output plumbing.
+        return [1.0, 0.0]
+
 
 def test_message_id_is_deterministic_and_distinguishes_ordinal():
     a = _message_id("t1", 100, "Alice", "hi", None, 0)
@@ -187,3 +193,65 @@ def test_extract_command_requires_chat_model(tmp_path, synthetic_archive, merge_
     result = runner.invoke(app, ["extract", "--config", str(merge_config_path), "--db", str(db_path)])
     assert result.exit_code == 1
     assert "chat_model" in result.output
+
+
+def test_extract_command_requires_embedding_model(tmp_path, synthetic_archive):
+    # chat_model set, embedding_model not -- must fail on the embedding_model check.
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "target: target\n"
+        "identities:\n"
+        "  - id: target\n"
+        '    display_name: "Alex Rivera"\n'
+        '    aliases: ["Alex Rivera", "Alex R."]\n'
+        "llm:\n  chat_model: test-model\n"
+    )
+    db_path = tmp_path / "chatmem.db"
+    runner.invoke(app, ["ingest", str(synthetic_archive), "--config", str(config_path), "--db", str(db_path)])
+    result = runner.invoke(app, ["extract", "--config", str(config_path), "--db", str(db_path)])
+    assert result.exit_code == 1
+    assert "embedding_model" in result.output
+
+
+def test_query_command_returns_statement_citation_and_source_message(
+    tmp_path, synthetic_archive, extract_config_path, monkeypatch
+):
+    monkeypatch.setattr(cli, "LLMClient", _FakeLLM)
+    db_path = tmp_path / "chatmem.db"
+    runner.invoke(
+        app, ["ingest", str(synthetic_archive), "--config", str(extract_config_path), "--db", str(db_path)]
+    )
+    runner.invoke(app, ["extract", "--config", str(extract_config_path), "--db", str(db_path)])
+
+    result = runner.invoke(
+        app, ["query", "what does Alex do", "--config", str(extract_config_path), "--db", str(db_path)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "Alex Rivera said something" in result.output
+    assert "thread_alpha" in result.output or "thread_beta" in result.output
+    assert ">" in result.output  # a quoted source message line
+
+
+def test_query_command_requires_embedding_model(tmp_path, synthetic_archive, merge_config_path):
+    db_path = tmp_path / "chatmem.db"
+    runner.invoke(
+        app, ["ingest", str(synthetic_archive), "--config", str(merge_config_path), "--db", str(db_path)]
+    )
+    result = runner.invoke(app, ["query", "anything", "--config", str(merge_config_path), "--db", str(db_path)])
+    assert result.exit_code == 1
+    assert "embedding_model" in result.output
+
+
+def test_query_command_reports_when_no_statements_embedded(
+    tmp_path, synthetic_archive, extract_config_path
+):
+    db_path = tmp_path / "chatmem.db"
+    runner.invoke(
+        app, ["ingest", str(synthetic_archive), "--config", str(extract_config_path), "--db", str(db_path)]
+    )
+    # No `extract` run -> no statements at all, let alone embedded ones.
+    result = runner.invoke(
+        app, ["query", "anything", "--config", str(extract_config_path), "--db", str(db_path)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "chatmem extract" in result.output

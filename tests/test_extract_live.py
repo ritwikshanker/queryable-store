@@ -1,11 +1,11 @@
-"""End-to-end extraction against a real LM Studio server.
+"""End-to-end extraction + query against a real LM Studio server.
 
 Skipped by default (pytest.ini's `addopts = -m 'not llm'`). Run explicitly with:
 
     uv run pytest -m llm tests/test_extract_live.py
 
-against a running LM Studio instance with config.yaml's llm.chat_model set to
-a model it actually serves.
+against a running LM Studio instance with config.yaml's llm.chat_model and
+llm.embedding_model both set to models it actually serves.
 """
 
 from pathlib import Path
@@ -23,10 +23,10 @@ runner = CliRunner()
 CONFIG_PATH = Path("config.yaml")
 
 
-def test_extract_against_live_lm_studio(tmp_path, synthetic_archive):
+def test_extract_and_query_against_live_lm_studio(tmp_path, synthetic_archive):
     cfg = load_config(CONFIG_PATH)
-    if not cfg.llm.chat_model:
-        pytest.skip("config.yaml has no llm.chat_model set")
+    if not cfg.llm.chat_model or not cfg.llm.embedding_model:
+        pytest.skip("config.yaml needs both llm.chat_model and llm.embedding_model set")
 
     db_path = tmp_path / "chatmem.db"
     extract_config = tmp_path / "config.yaml"
@@ -36,7 +36,10 @@ def test_extract_against_live_lm_studio(tmp_path, synthetic_archive):
         "  - id: target\n"
         '    display_name: "Alex Rivera"\n'
         '    aliases: ["Alex Rivera", "Alex R."]\n'
-        f"llm:\n  chat_model: {cfg.llm.chat_model!r}\n  base_url: {cfg.llm.base_url!r}\n"
+        "llm:\n"
+        f"  chat_model: {cfg.llm.chat_model!r}\n"
+        f"  embedding_model: {cfg.llm.embedding_model!r}\n"
+        f"  base_url: {cfg.llm.base_url!r}\n"
     )
 
     ingest_result = runner.invoke(
@@ -57,3 +60,8 @@ def test_extract_against_live_lm_studio(tmp_path, synthetic_archive):
     for s in statements:
         assert s.text
         assert s.person_id == "target"
+
+    query_result = runner.invoke(
+        app, ["query", "what does Alex do", "--config", str(extract_config), "--db", str(db_path)]
+    )
+    assert query_result.exit_code == 0, query_result.output

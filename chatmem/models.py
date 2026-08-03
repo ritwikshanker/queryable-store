@@ -89,3 +89,4 @@ class Statement:
     start_ts: str
     end_ts: str
     created_at: str
+    embedding: list[float] | None = None

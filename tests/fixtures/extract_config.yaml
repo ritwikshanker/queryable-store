@@ -1,6 +1,6 @@
-# Same identities as merge_config.yaml, plus an llm.chat_model set so
-# `chatmem extract` doesn't fail its config check. Tests still stub out the
-# actual LLM client -- no real model is ever called.
+# Same identities as merge_config.yaml, plus llm.chat_model/embedding_model set
+# so `chatmem extract`/`chatmem query` don't fail their config checks. Tests
+# still stub out the actual LLM client -- no real model is ever called.
 target: target
 
 identities:
@@ -13,3 +13,4 @@ identities:
 
 llm:
   chat_model: "test-model"
+  embedding_model: "test-embed-model"

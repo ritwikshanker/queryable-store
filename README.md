@@ -44,9 +44,42 @@ chatmem ingest path/to/messages/inbox        # parse, normalize, sessionize
 chatmem identities                           # see who was found, and how they mapped
 chatmem stats                                # counts per thread and per person
 chatmem sessions                             # session ranges
+chatmem extract                              # LLM pass: sessions -> statements
+chatmem query "where has Alex lived?"        # semantic search over those statements
+chatmem statements                           # list what was extracted
+chatmem export --format csv                  # dump statements as JSON or CSV
 ```
 
-`ingest` accepts either a single thread directory or an inbox root containing many.
+`ingest` accepts a single thread directory, an inbox root containing many, or a WhatsApp
+`.txt` export.
+
+### extract
+
+`extract` is the slow, expensive step: one chat call per session, plus one batched
+embedding call. It is resumable — each session is committed as it finishes, and a re-run
+skips sessions already processed, so an interrupted run picks up where it stopped. Use
+`--force` to redo them anyway (required after changing `llm.embedding_model`, since
+vectors from different models are not comparable).
+
+Statements that restate something already extracted are dropped; tune or disable that
+with `extraction.dedup_threshold` in `config.yaml`.
+
+### query
+
+`query` embeds your question and ranks the target's statements by cosine similarity,
+printing each match with its score, its date range, and the original messages it came
+from:
+
+```
+[1] [0.782] Moved to Berlin in the spring.
+    thread_alpha  2023-04-02T18:20:01.000000Z .. 2023-04-02T18:24:55.000000Z
+    > Alex Rivera: finally made the move to berlin last week
+```
+
+Narrow the search with `--thread`, `--since` / `--until` (`YYYY-MM-DD`), `--min-score`,
+and `--limit`. By default the command returns ranked statements, not prose; pass
+`--answer` to also have the chat model compose an answer from the top results, citing
+them by the same numbers.
 
 ## Identities: one person, several accounts
 
@@ -81,19 +114,31 @@ name cannot be split apart.
 
 ## Supported archives
 
-Instagram's JSON export (`messages/inbox/<thread>/message_N.json`) today. Parsers sit
-behind a `Parser` protocol, so other sources can be added without touching the rest of
-the pipeline.
+Instagram's JSON export (`messages/inbox/<thread>/message_N.json`) and WhatsApp's
+"Export chat" `.txt` file. Parsers sit behind a `Parser` protocol, so other sources can
+be added without touching the rest of the pipeline. Pass `--source instagram|whatsapp` if
+auto-detection picks wrong.
 
 The Instagram parser handles the export's quirks explicitly: text stored as UTF-8 bytes
 written out as latin-1, threads split across numbered files with messages newest-first
 inside each one, reactions and call logs and unsend tombstones, and media messages that
 carry no text.
 
+The WhatsApp parser handles both the iOS and Android line layouts, messages that span
+several lines, media placeholders, and system notices. WhatsApp records no time zone and
+no date order, so the day/month order is inferred per file and times are read as UTC —
+consistent within a thread, which is what sessionizing depends on.
+
 ## Storage
 
 One SQLite file, `data/chatmem.db` by default (`--db` overrides). Re-running `ingest` on
-the same archive replaces rows rather than duplicating them.
+the same archive replaces rows rather than duplicating them, and statements already
+extracted for a session survive the rebuild as long as that session's messages haven't
+changed — so re-ingesting doesn't throw away LLM work. If a session's messages did
+change, its statements are dropped and it is queued for re-extraction.
+
+The schema migrates itself forward on connect. Back up `data/chatmem.db` before the first
+run after an upgrade.
 
 ## License
 

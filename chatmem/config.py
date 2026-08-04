@@ -46,6 +46,10 @@ class SessionizeConfig:
 @dataclass(frozen=True)
 class ExtractionConfig:
     validation_pass: bool = False
+    # Cosine similarity at or above which a newly extracted statement is
+    # treated as a restatement of one already stored and dropped. 0 (or less)
+    # disables the check.
+    dedup_threshold: float = 0.92
 
 
 @dataclass(frozen=True)
@@ -147,7 +151,15 @@ def _parse_extraction(raw: Any) -> ExtractionConfig:
         return ExtractionConfig()
     if not isinstance(raw, dict):
         raise ConfigError("'extraction' must be a mapping")
-    return ExtractionConfig(validation_pass=bool(raw.get("validation_pass", False)))
+    threshold = raw.get("dedup_threshold", 0.92)
+    if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+        raise ConfigError("'extraction.dedup_threshold' must be a number")
+    if threshold > 1:
+        raise ConfigError("'extraction.dedup_threshold' must be <= 1 (cosine similarity)")
+    return ExtractionConfig(
+        validation_pass=bool(raw.get("validation_pass", False)),
+        dedup_threshold=float(threshold),
+    )
 
 
 def load_config(path: Path | None = None) -> Config:

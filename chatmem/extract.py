@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 from chatmem.llm import LLMClient
 from chatmem.models import Message, Session, Statement
+from chatmem.query import cosine_similarity
 
 
 def _render_message(m: Message) -> str:
@@ -75,8 +76,10 @@ def extract_session(
         candidates = [c for c, ok in zip(candidates, supported) if ok]
 
     created_at = _now_iso()
+    # One embedding call for the whole session rather than one per statement.
+    embeddings = llm.embed([text for text, _ in candidates])
     statements: list[Statement] = []
-    for text, cited in candidates:
+    for (text, cited), embedding in zip(candidates, embeddings):
         if cited:
             source_ids = [m.id for m in cited]
             start_ts = min(m.timestamp_utc for m in cited)
@@ -95,8 +98,38 @@ def extract_session(
                 source_message_ids=source_ids,
                 start_ts=start_ts,
                 end_ts=end_ts,
-                embedding=llm.embed(text),
+                embedding=embedding,
                 created_at=created_at,
             )
         )
     return statements
+
+
+def dedup_statements(
+    new: list[Statement], existing: list[list[float]], threshold: float
+) -> tuple[list[Statement], int]:
+    """Drop statements that restate something already extracted.
+
+    The same fact often comes up in several sessions ("I moved to Berlin"),
+    and near-duplicates crowd out other results at query time. Compares each
+    new statement against `existing` embeddings and against the ones already
+    kept from this batch. A threshold <= 0 disables the check.
+
+    Returns the kept statements and how many were dropped.
+    """
+    if threshold <= 0:
+        return new, 0
+
+    seen = list(existing)
+    kept: list[Statement] = []
+    dropped = 0
+    for statement in new:
+        if statement.embedding is None:
+            kept.append(statement)
+            continue
+        if any(cosine_similarity(statement.embedding, other) >= threshold for other in seen):
+            dropped += 1
+            continue
+        seen.append(statement.embedding)
+        kept.append(statement)
+    return kept, dropped

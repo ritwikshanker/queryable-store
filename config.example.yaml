@@ -39,3 +39,7 @@ sessionize:
 
 extraction:
   validation_pass: false
+  # A newly extracted statement whose embedding is this similar to one
+  # already stored is treated as a restatement and dropped. Set to 0 to keep
+  # every statement.
+  dedup_threshold: 0.92

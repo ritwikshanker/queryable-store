@@ -25,8 +25,12 @@ class FakeClient:
 
     def _embed(self, **kwargs):
         self.embedding_calls.append(kwargs)
-        vector = self._embeddings.pop(0)
-        return SimpleNamespace(data=[SimpleNamespace(embedding=vector)])
+        n = len(kwargs["input"])
+        vectors = [self._embeddings.pop(0) for _ in range(n)]
+        # Deliberately shuffled: the API doesn't promise response order, so
+        # LLMClient.embed must re-order by each datum's index.
+        data = [SimpleNamespace(index=i, embedding=v) for i, v in enumerate(vectors)]
+        return SimpleNamespace(data=list(reversed(data)))
 
 
 def _client(monkeypatch, responses: list[str], max_retries: int = 3) -> tuple[LLMClient, FakeClient]:
@@ -61,17 +65,29 @@ def test_embed_raises_config_error_when_embedding_model_unset(monkeypatch):
     monkeypatch.setattr(llm_module, "OpenAI", lambda **kwargs: FakeClient())
     client = LLMClient(LLMConfig(chat_model="test-model", embedding_model=""))
     with pytest.raises(LLMConfigError):
-        client.embed("some text")
+        client.embed(["some text"])
 
 
-def test_embed_returns_vector_from_response(monkeypatch):
-    fake = FakeClient(embeddings=[[0.1, 0.2, 0.3]])
+def test_embed_returns_vectors_in_input_order_from_one_call(monkeypatch):
+    fake = FakeClient(embeddings=[[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]])
     monkeypatch.setattr(llm_module, "OpenAI", lambda **kwargs: fake)
     client = LLMClient(LLMConfig(chat_model="test-model", embedding_model="test-embed-model"))
-    result = client.embed("some text")
-    assert result == [0.1, 0.2, 0.3]
+
+    result = client.embed(["a", "b", "c"])
+
+    # One round-trip for the whole batch, results realigned to input order.
+    assert len(fake.embedding_calls) == 1
+    assert result == [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]]
     assert fake.embedding_calls[0]["model"] == "test-embed-model"
-    assert fake.embedding_calls[0]["input"] == "some text"
+    assert fake.embedding_calls[0]["input"] == ["a", "b", "c"]
+
+
+def test_embed_short_circuits_on_empty_input(monkeypatch):
+    fake = FakeClient()
+    monkeypatch.setattr(llm_module, "OpenAI", lambda **kwargs: fake)
+    client = LLMClient(LLMConfig(chat_model="test-model", embedding_model="test-embed-model"))
+    assert client.embed([]) == []
+    assert fake.embedding_calls == []
 
 
 def test_extract_statements_parses_valid_json(monkeypatch):

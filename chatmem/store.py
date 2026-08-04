@@ -10,13 +10,17 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from array import array
+from collections import defaultdict
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from chatmem.identity import IdentityResolver
 from chatmem.models import Message, Person, Session, Statement
 from chatmem.parsers.text import normalize_alias
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _SCHEMA_SQL = """
 CREATE TABLE people (
@@ -61,7 +65,8 @@ CREATE TABLE sessions (
     end_seq       INTEGER NOT NULL,
     start_ts      TEXT NOT NULL,
     end_ts        TEXT NOT NULL,
-    message_count INTEGER NOT NULL
+    message_count INTEGER NOT NULL,
+    extracted_at  TEXT  -- NULL until `chatmem extract` processes the session
 );
 CREATE INDEX sessions_thread ON sessions(thread_id, start_seq);
 
@@ -86,16 +91,96 @@ CREATE TABLE statements (
     start_ts           TEXT NOT NULL,
     end_ts             TEXT NOT NULL,
     created_at         TEXT NOT NULL,
-    embedding          TEXT  -- JSON list of floats; NULL until embedded
+    embedding          BLOB  -- packed float32 vector; NULL until embedded
 );
 CREATE INDEX statements_person ON statements(person_id);
 CREATE INDEX statements_session ON statements(session_id);
 """
 
+
+def _pack_embedding(vec: list[float]) -> bytes:
+    return array("f", vec).tobytes()
+
+
+def _unpack_embedding(blob: bytes) -> list[float]:
+    return list(array("f", blob))
+
+
+def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
+    """v3 -> v4: statements.embedding JSON text -> packed float32 BLOB, and
+    sessions.extracted_at backfilled from existing statements so already-
+    extracted sessions are recognized by extract's resume logic.
+
+    Rebuilds the statements table (SQLite can't alter a column's type), so
+    foreign key enforcement is suspended for the rename/drop dance. The
+    pragma only takes effect outside a transaction, hence the explicit
+    commit/BEGIN ordering -- the rebuild itself is atomic.
+    """
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("BEGIN")
+    try:
+        conn.execute("ALTER TABLE sessions ADD COLUMN extracted_at TEXT")
+        conn.execute("ALTER TABLE statements RENAME TO statements_old")
+        conn.execute(
+            """
+            CREATE TABLE statements (
+                id                 INTEGER PRIMARY KEY,
+                person_id          TEXT NOT NULL REFERENCES people(person_id),
+                session_id         INTEGER NOT NULL REFERENCES sessions(id),
+                thread_id          TEXT NOT NULL REFERENCES threads(thread_id),
+                text               TEXT NOT NULL,
+                source_message_ids TEXT NOT NULL,
+                start_ts           TEXT NOT NULL,
+                end_ts             TEXT NOT NULL,
+                created_at         TEXT NOT NULL,
+                embedding          BLOB
+            )
+            """
+        )
+        for row in conn.execute(
+            "SELECT id, person_id, session_id, thread_id, text, source_message_ids, "
+            "start_ts, end_ts, created_at, embedding FROM statements_old"
+        ).fetchall():
+            embedding = row["embedding"]
+            blob = _pack_embedding(json.loads(embedding)) if embedding is not None else None
+            conn.execute(
+                "INSERT INTO statements (id, person_id, session_id, thread_id, text, "
+                "source_message_ids, start_ts, end_ts, created_at, embedding) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    row["id"],
+                    row["person_id"],
+                    row["session_id"],
+                    row["thread_id"],
+                    row["text"],
+                    row["source_message_ids"],
+                    row["start_ts"],
+                    row["end_ts"],
+                    row["created_at"],
+                    blob,
+                ),
+            )
+        conn.execute("DROP TABLE statements_old")
+        conn.execute("CREATE INDEX statements_person ON statements(person_id)")
+        conn.execute("CREATE INDEX statements_session ON statements(session_id)")
+        conn.execute(
+            "UPDATE sessions SET extracted_at = "
+            "(SELECT MAX(created_at) FROM statements WHERE statements.session_id = sessions.id) "
+            "WHERE id IN (SELECT DISTINCT session_id FROM statements)"
+        )
+    except Exception:
+        conn.rollback()
+        conn.execute("PRAGMA foreign_keys=ON")
+        raise
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys=ON")
+
 # Migrations applied in order to bring an existing DB from one
 # schema_version to the next, so older databases keep working without a
-# re-ingest. Each entry upgrades from its key to key+1.
-_MIGRATIONS: dict[int, str] = {
+# re-ingest. Each entry upgrades from its key to key+1. A string is run as
+# a script; a callable is used when the step needs to transform data.
+_MIGRATIONS: dict[int, str | Callable[[sqlite3.Connection], None]] = {
     1: """
     CREATE TABLE statements (
         id                 INTEGER PRIMARY KEY,
@@ -112,6 +197,7 @@ _MIGRATIONS: dict[int, str] = {
     CREATE INDEX statements_session ON statements(session_id);
     """,
     2: "ALTER TABLE statements ADD COLUMN embedding TEXT;",
+    3: _migrate_v3_to_v4,
 }
 
 
@@ -141,18 +227,40 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
     version = int(row["value"]) if row else 1
     while version < SCHEMA_VERSION:
-        conn.executescript(_MIGRATIONS[version])
+        step = _MIGRATIONS[version]
+        if callable(step):
+            step(conn)
+        else:
+            conn.executescript(step)
         version += 1
         conn.execute(
             "UPDATE meta SET value = ? WHERE key = 'schema_version'", (str(version),)
         )
-    conn.commit()
+        conn.commit()
+
+
+# --- meta ----------------------------------------------------------------
+
+
+def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row is not None else None
+
+
+def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value),
+    )
 
 
 # --- identity ----------------------------------------------------------
 
 
-def save_identities(conn: sqlite3.Connection, resolver: IdentityResolver) -> None:
+def save_identities(
+    conn: sqlite3.Connection, resolver: IdentityResolver, commit: bool = True
+) -> None:
     people = resolver.people()
     conn.executemany(
         "INSERT INTO people (person_id, display_name, origin) VALUES (?, ?, ?) "
@@ -166,23 +274,76 @@ def save_identities(conn: sqlite3.Connection, resolver: IdentityResolver) -> Non
         "person_id=excluded.person_id",
         resolver.alias_rows(),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
-def relink_messages(conn: sqlite3.Connection, resolver: IdentityResolver) -> int:
+@dataclass(frozen=True)
+class RelinkResult:
+    messages: int
+    statements: int
+    # Sessions whose statements could not be re-attributed because one old
+    # person split into several new ones -- re-extract those to fix them.
+    ambiguous_session_ids: list[int]
+
+
+def relink_messages(conn: sqlite3.Connection, resolver: IdentityResolver) -> RelinkResult:
     """Re-resolve every message's person_id from the current resolver state.
 
     Used by `chatmem relink` after config.yaml's identities change, without
-    re-parsing the source archive.
+    re-parsing the source archive. Everything derived from person_id is
+    rebuilt too: session_participants (which `extract` uses to decide whether
+    the target took part) and statements.person_id (which `query` filters on),
+    since leaving those stale would silently hide already-extracted facts.
     """
-    rows = conn.execute("SELECT id, sender FROM messages").fetchall()
-    updates = [(resolver.resolve(row["sender"]), row["id"]) for row in rows]
+    rows = conn.execute("SELECT id, sender, person_id FROM messages").fetchall()
+    updates: list[tuple[str, str]] = []
+    remap: dict[str, set[str]] = defaultdict(set)
+    for row in rows:
+        new_pid = resolver.resolve(row["sender"])
+        updates.append((new_pid, row["id"]))
+        if new_pid != row["person_id"]:
+            remap[row["person_id"]].add(new_pid)
+
     # Any newly auto-created people must exist before messages can
     # reference them (person_id is a foreign key).
-    save_identities(conn, resolver)
+    save_identities(conn, resolver, commit=False)
     conn.executemany("UPDATE messages SET person_id = ? WHERE id = ?", updates)
+
+    # session_participants is a pure function of the new message rows.
+    conn.execute("DELETE FROM session_participants")
+    conn.execute(
+        "INSERT INTO session_participants (session_id, person_id) "
+        "SELECT DISTINCT s.id, m.person_id FROM sessions s "
+        "JOIN messages m ON m.thread_id = s.thread_id "
+        "AND m.seq BETWEEN s.start_seq AND s.end_seq"
+    )
+
+    n_statements = 0
+    ambiguous: list[int] = []
+    for old_pid, new_pids in remap.items():
+        if len(new_pids) == 1:
+            cur = conn.execute(
+                "UPDATE statements SET person_id = ? WHERE person_id = ?",
+                (next(iter(new_pids)), old_pid),
+            )
+            n_statements += cur.rowcount
+        else:
+            # A split: which new person a statement belongs to can't be
+            # decided without re-reading the transcript.
+            ambiguous.extend(
+                r["session_id"]
+                for r in conn.execute(
+                    "SELECT DISTINCT session_id FROM statements WHERE person_id = ? "
+                    "ORDER BY session_id",
+                    (old_pid,),
+                ).fetchall()
+            )
+
     conn.commit()
-    return len(updates)
+    return RelinkResult(
+        messages=len(updates), statements=n_statements, ambiguous_session_ids=sorted(ambiguous)
+    )
 
 
 def all_people(conn: sqlite3.Connection) -> list[Person]:
@@ -299,6 +460,11 @@ def replace_thread_sessions(
         conn.executemany(
             "DELETE FROM session_participants WHERE session_id = ?", [(i,) for i in old_ids]
         )
+    # statements.session_id is a NOT NULL foreign key, so any statements
+    # still pointing at these sessions must go first or the delete fails.
+    # Callers that want to keep them (re-ingest) go through
+    # replace_thread_content, which snapshots and restores them.
+    conn.execute("DELETE FROM statements WHERE thread_id = ?", (thread_id,))
     conn.execute("DELETE FROM sessions WHERE thread_id = ?", (thread_id,))
 
     saved: list[Session] = []
@@ -335,12 +501,79 @@ def replace_thread_sessions(
     return saved
 
 
+def replace_thread_content(
+    conn: sqlite3.Connection,
+    thread_id: str,
+    messages: list[Message],
+    ranges: list[tuple[int, int]],
+    messages_by_seq: dict[int, Message],
+) -> tuple[list[Session], int]:
+    """Replace a thread's messages and sessions, preserving statements whose
+    session came through the rebuild unchanged.
+
+    Extraction is the expensive part of the pipeline, so re-ingesting an
+    archive that hasn't changed must not throw its output away. A session is
+    considered the same session if its range, bounds and size all match and
+    every message its statements cite still exists -- message ids are content
+    hashes, so any edit to the cited text breaks the match and the session is
+    left unextracted for `chatmem extract` to redo.
+
+    Returns the saved sessions and how many statements were carried over.
+    """
+    old_sessions = {
+        (r["start_seq"], r["end_seq"], r["start_ts"], r["end_ts"], r["message_count"]): (
+            r["id"],
+            r["extracted_at"],
+        )
+        for r in conn.execute(
+            "SELECT id, start_seq, end_seq, start_ts, end_ts, message_count, extracted_at "
+            "FROM sessions WHERE thread_id = ?",
+            (thread_id,),
+        ).fetchall()
+    }
+    old_statements: dict[int, list[Statement]] = defaultdict(list)
+    for s in list_statements(conn, thread_id=thread_id):
+        old_statements[s.session_id].append(s)
+
+    replace_thread_messages(conn, thread_id, messages)
+    saved = replace_thread_sessions(conn, thread_id, ranges, messages_by_seq)
+
+    live_ids = {m.id for m in messages}
+    preserved = 0
+    for session in saved:
+        key = (
+            session.start_seq,
+            session.end_seq,
+            session.start_ts,
+            session.end_ts,
+            session.message_count,
+        )
+        match = old_sessions.get(key)
+        if match is None:
+            continue
+        old_id, extracted_at = match
+        carried = old_statements.get(old_id, [])
+        if any(mid not in live_ids for s in carried for mid in s.source_message_ids):
+            continue
+        if carried:
+            replace_session_statements(
+                conn,
+                session.id,
+                [replace(s, id=None, session_id=session.id) for s in carried],
+            )
+            preserved += len(carried)
+        if extracted_at is not None:
+            mark_session_extracted(conn, session.id, extracted_at)
+
+    return saved, preserved
+
+
 def list_sessions(
     conn: sqlite3.Connection, thread_id: str | None = None, limit: int | None = None
 ) -> list[Session]:
     sql = (
-        "SELECT id, thread_id, start_seq, end_seq, start_ts, end_ts, message_count "
-        "FROM sessions"
+        "SELECT id, thread_id, start_seq, end_seq, start_ts, end_ts, message_count, "
+        "extracted_at FROM sessions"
     )
     params: list[object] = []
     if thread_id is not None:
@@ -360,9 +593,23 @@ def list_sessions(
             start_ts=r["start_ts"],
             end_ts=r["end_ts"],
             message_count=r["message_count"],
+            extracted_at=r["extracted_at"],
         )
         for r in rows
     ]
+
+
+def mark_session_extracted(conn: sqlite3.Connection, session_id: int, when: str) -> None:
+    conn.execute("UPDATE sessions SET extracted_at = ? WHERE id = ?", (when, session_id))
+
+
+def participants_by_session(conn: sqlite3.Connection) -> dict[int, set[str]]:
+    """Every session's participants in one query -- `extract` needs this for
+    each session it considers, and one query per session added up."""
+    result: dict[int, set[str]] = defaultdict(set)
+    for r in conn.execute("SELECT session_id, person_id FROM session_participants").fetchall():
+        result[r["session_id"]].add(r["person_id"])
+    return result
 
 
 def session_participant_ids(conn: sqlite3.Connection, session_id: int) -> set[str]:
@@ -419,7 +666,7 @@ def replace_session_statements(
                 s.start_ts,
                 s.end_ts,
                 s.created_at,
-                json.dumps(s.embedding) if s.embedding is not None else None,
+                _pack_embedding(s.embedding) if s.embedding is not None else None,
             )
             for s in statements
         ],
@@ -430,6 +677,7 @@ def list_statements(
     conn: sqlite3.Connection,
     person_id: str | None = None,
     thread_id: str | None = None,
+    session_id: int | None = None,
     limit: int | None = None,
 ) -> list[Statement]:
     sql = (
@@ -444,6 +692,9 @@ def list_statements(
     if thread_id is not None:
         clauses.append("thread_id = ?")
         params.append(thread_id)
+    if session_id is not None:
+        clauses.append("session_id = ?")
+        params.append(session_id)
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)
     sql += " ORDER BY start_ts ASC"
@@ -462,7 +713,7 @@ def list_statements(
             start_ts=r["start_ts"],
             end_ts=r["end_ts"],
             created_at=r["created_at"],
-            embedding=json.loads(r["embedding"]) if r["embedding"] is not None else None,
+            embedding=_unpack_embedding(r["embedding"]) if r["embedding"] is not None else None,
         )
         for r in rows
     ]

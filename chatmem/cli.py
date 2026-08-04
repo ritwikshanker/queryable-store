@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import csv
 import hashlib
+import io
+import json
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,7 +15,7 @@ import typer
 
 from chatmem import store
 from chatmem.config import Config, load_config
-from chatmem.extract import extract_session
+from chatmem.extract import dedup_statements, extract_session
 from chatmem.identity import IdentityResolver
 from chatmem.llm import LLMClient, LLMResponseError
 from chatmem.models import Message
@@ -34,12 +37,40 @@ def _load_cfg(
     return cfg.with_overrides(target=target, db_path=db)
 
 
+def _now_iso() -> str:
+    return datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+
+
 def _ms_to_iso(ms: int) -> str:
     dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
     # Explicit microsecond formatting (not dt.isoformat()) so every
     # timestamp has the same length and sorts correctly as plain text,
     # regardless of whether the microsecond component happens to be zero.
     return dt.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+
+
+def _parse_when(value: Optional[str], *, end: bool) -> Optional[str]:
+    """Normalize a --since/--until value to the stored timestamp format.
+
+    Stored timestamps are fixed-width ISO-8601 UTC precisely so they compare
+    correctly as plain strings, so filtering is a string comparison once the
+    bound is padded out. A bare date expands to the start of that day, or to
+    its last microsecond when it's an upper bound.
+    """
+    if value is None:
+        return None
+    text = value.strip()
+    try:
+        if len(text) == 10:
+            day = datetime.strptime(text, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            dt = day.replace(hour=23, minute=59, second=59, microsecond=999999) if end else day
+        else:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+    except ValueError as e:
+        raise ValueError(f"could not read {value!r} as a date (use YYYY-MM-DD): {e}") from e
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
 
 def _message_id(
@@ -79,6 +110,7 @@ def ingest(
     n_threads = 0
     n_kept = 0
     n_sessions = 0
+    n_preserved = 0
     dropped_by_reason: dict[str, int] = defaultdict(int)
 
     for thread in parser.parse(path):
@@ -108,9 +140,9 @@ def ingest(
         # People referenced by these messages (including any just
         # auto-created by resolver.resolve() above) must exist before the
         # messages that reference them, since messages.person_id is a
-        # foreign key.
-        store.save_identities(conn, resolver)
-        store.replace_thread_messages(conn, thread.thread_id, normalized)
+        # foreign key. Committing is deferred so the whole thread lands as
+        # one transaction -- a crash mid-thread rolls back cleanly.
+        store.save_identities(conn, resolver, commit=False)
         n_kept += len(normalized)
         for reason, count in thread.dropped.items():
             dropped_by_reason[reason] += count
@@ -121,8 +153,12 @@ def ingest(
             max_messages=cfg.sessionize.max_messages,
         )
         messages_by_seq = {m.seq: m for m in normalized}
-        saved = store.replace_thread_sessions(conn, thread.thread_id, ranges, messages_by_seq)
+        saved, preserved = store.replace_thread_content(
+            conn, thread.thread_id, normalized, ranges, messages_by_seq
+        )
         n_sessions += len(saved)
+        n_preserved += preserved
+        conn.commit()
 
     store.save_identities(conn, resolver)
     conn.commit()
@@ -135,6 +171,8 @@ def ingest(
     else:
         typer.echo("dropped:  0")
     typer.echo(f"sessions: {n_sessions}")
+    if n_preserved:
+        typer.echo(f"statements preserved: {n_preserved}")
 
     new_senders = resolver.new_senders()
     if new_senders:
@@ -204,8 +242,17 @@ def relink(
     cfg = _load_cfg(config, db=db)
     conn = store.connect(cfg.db_path)
     resolver = IdentityResolver(cfg.identities)
-    n = store.relink_messages(conn, resolver)
-    typer.echo(f"relinked {n} messages")
+    result = store.relink_messages(conn, resolver)
+    typer.echo(f"relinked {result.messages} messages")
+    if result.statements:
+        typer.echo(f"re-attributed {result.statements} statements")
+    if result.ambiguous_session_ids:
+        ids = ", ".join(f"#{i}" for i in result.ambiguous_session_ids)
+        typer.echo(
+            f"\nWarning: one person was split into several, so statements in these "
+            f"sessions could not be re-attributed: {ids}\n"
+            "Re-extract them with `chatmem extract --force`."
+        )
 
     new_senders = resolver.new_senders()
     if new_senders:
@@ -255,16 +302,138 @@ def sessions(
         )
 
 
+def _resolve_person_or_exit(conn, value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    person_id = store.resolve_person(conn, value)
+    if person_id is None:
+        typer.echo(f"Error: person {value!r} was not found.", err=True)
+        raise typer.Exit(code=1)
+    return person_id
+
+
+@app.command()
+def statements(
+    person: Optional[str] = typer.Option(None, "--person", help="A person_id or alias."),
+    thread: Optional[str] = typer.Option(None, "--thread"),
+    session: Optional[int] = typer.Option(None, "--session", help="A session id from `sessions`."),
+    limit: Optional[int] = typer.Option(None, "--limit"),
+    config: Path = typer.Option(Path("config.yaml"), "--config"),
+    db: Optional[Path] = typer.Option(None, "--db"),
+) -> None:
+    """List extracted statements. No LLM involved."""
+    cfg = _load_cfg(config, db=db)
+    conn = store.connect(cfg.db_path)
+
+    person_id = _resolve_person_or_exit(conn, person)
+    rows = store.list_statements(
+        conn, person_id=person_id, thread_id=thread, session_id=session, limit=limit
+    )
+    if not rows:
+        typer.echo("No statements found. Run `chatmem extract` first.")
+        return
+
+    for s in rows:
+        typer.echo(
+            f"#{s.id:<5} [{s.person_id:12}] {s.start_ts[:10]}..{s.end_ts[:10]} "
+            f"(session #{s.session_id}, {s.thread_id})"
+        )
+        typer.echo(f"      {s.text}")
+
+
+@app.command()
+def export(
+    format: str = typer.Option("json", "--format", help="json or csv."),
+    out: Optional[Path] = typer.Option(None, "--out", help="Write to a file instead of stdout."),
+    person: Optional[str] = typer.Option(None, "--person", help="A person_id or alias."),
+    thread: Optional[str] = typer.Option(None, "--thread"),
+    session: Optional[int] = typer.Option(None, "--session"),
+    config: Path = typer.Option(Path("config.yaml"), "--config"),
+    db: Optional[Path] = typer.Option(None, "--db"),
+) -> None:
+    """Export statements as JSON or CSV. Embeddings are not included."""
+    fmt = format.lower()
+    if fmt not in {"json", "csv"}:
+        typer.echo(f"Error: unknown --format {format!r} (use json or csv).", err=True)
+        raise typer.Exit(code=1)
+
+    cfg = _load_cfg(config, db=db)
+    conn = store.connect(cfg.db_path)
+
+    person_id = _resolve_person_or_exit(conn, person)
+    rows = store.list_statements(
+        conn, person_id=person_id, thread_id=thread, session_id=session
+    )
+    names = {p.person_id: p.display_name for p in store.all_people(conn)}
+    records = [
+        {
+            "id": s.id,
+            "person_id": s.person_id,
+            "display_name": names.get(s.person_id, s.person_id),
+            "thread_id": s.thread_id,
+            "session_id": s.session_id,
+            "start_ts": s.start_ts,
+            "end_ts": s.end_ts,
+            "created_at": s.created_at,
+            "text": s.text,
+            "source_message_ids": s.source_message_ids,
+        }
+        for s in rows
+    ]
+
+    buffer = io.StringIO()
+    if fmt == "json":
+        json.dump(records, buffer, indent=2, ensure_ascii=False)
+        buffer.write("\n")
+    else:
+        writer = csv.DictWriter(buffer, fieldnames=list(_EXPORT_FIELDS))
+        writer.writeheader()
+        for record in records:
+            # One cell can't hold a list; the ids are space-separated so the
+            # column stays greppable.
+            writer.writerow({**record, "source_message_ids": " ".join(record["source_message_ids"])})
+    payload = buffer.getvalue()
+
+    if out is None:
+        typer.echo(payload, nl=False)
+    else:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(payload, encoding="utf-8")
+        typer.echo(f"wrote {len(records)} statements to {out}")
+
+
+_EXPORT_FIELDS = (
+    "id",
+    "person_id",
+    "display_name",
+    "thread_id",
+    "session_id",
+    "start_ts",
+    "end_ts",
+    "created_at",
+    "text",
+    "source_message_ids",
+)
+
+
 @app.command()
 def extract(
     thread: Optional[str] = typer.Option(None, "--thread"),
+    force: bool = typer.Option(
+        False, "--force", help="Re-extract sessions that were already processed."
+    ),
     config: Path = typer.Option(Path("config.yaml"), "--config"),
     target: Optional[str] = typer.Option(
         None, "--target", help="Override config.yaml's target for this run."
     ),
     db: Optional[Path] = typer.Option(None, "--db"),
 ) -> None:
-    """Run each session the target participated in through the LLM, storing statements."""
+    """Run each session the target participated in through the LLM, storing statements.
+
+    Resumable: sessions already processed are skipped unless --force is given,
+    and each session is committed as it completes, so an interrupted run keeps
+    the work it finished.
+    """
     cfg = _load_cfg(config, db=db, target=target)
     if not cfg.target:
         typer.echo(
@@ -292,55 +461,137 @@ def extract(
         )
         raise typer.Exit(code=1)
 
+    # Vectors from different embedding models aren't comparable, so a whole
+    # DB is embedded with one model. Changing models means re-embedding
+    # everything, which is what --force (across all threads) does.
+    stored_model = store.get_meta(conn, "embedding_model")
+    if stored_model is not None and stored_model != cfg.llm.embedding_model:
+        if not force or thread is not None:
+            typer.echo(
+                f"Error: stored statements were embedded with {stored_model!r}, but "
+                f"config.yaml says {cfg.llm.embedding_model!r}. Re-embed everything with "
+                "`chatmem extract --force` (without --thread).",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        store.set_meta(conn, "embedding_model", cfg.llm.embedding_model)
+        store.set_meta(conn, "embedding_dim", "")
+        conn.commit()
+        stored_model = cfg.llm.embedding_model
+        # Old vectors are about to be replaced; don't dedup against them.
+        drop_existing_embeddings = True
+    else:
+        drop_existing_embeddings = False
+
     display_name_by_person = {p.person_id: p.display_name for p in store.all_people(conn)}
     target_name = display_name_by_person.get(target_person_id, target_person_id)
 
+    participants_by_session = store.participants_by_session(conn)
+    # Dedup compares against what the target already has stored; kept
+    # statements are appended as sessions complete.
+    seen_embeddings = (
+        []
+        if drop_existing_embeddings
+        else [
+            s.embedding
+            for s in store.list_statements(conn, person_id=target_person_id)
+            if s.embedding is not None
+        ]
+    )
+
     n_skipped = 0
+    n_done = 0
     n_failed = 0
     n_extracted = 0
     n_processed = 0
+    n_deduped = 0
 
-    for session in store.list_sessions(conn, thread_id=thread):
-        participants = store.session_participant_ids(conn, session.id)
-        if target_person_id not in participants:
-            n_skipped += 1
-            continue
+    sessions = store.list_sessions(conn, thread_id=thread)
+    total = len(sessions)
+    interrupted = False
 
-        messages = store.session_messages(
-            conn, session.thread_id, session.start_seq, session.end_seq
-        )
-        try:
-            statements = extract_session(
-                session,
-                messages,
-                target_person_id,
-                target_name,
-                llm,
-                display_name_by_person,
-                validation_pass=cfg.extraction.validation_pass,
+    try:
+        for i, session in enumerate(sessions, start=1):
+            if target_person_id not in participants_by_session.get(session.id, set()):
+                n_skipped += 1
+                continue
+            if session.extracted_at is not None and not force:
+                n_done += 1
+                continue
+
+            messages = store.session_messages(
+                conn, session.thread_id, session.start_seq, session.end_seq
             )
-        except LLMResponseError as e:
-            typer.echo(f"Warning: session #{session.id} failed: {e}")
-            n_failed += 1
-            continue
+            try:
+                statements = extract_session(
+                    session,
+                    messages,
+                    target_person_id,
+                    target_name,
+                    llm,
+                    display_name_by_person,
+                    validation_pass=cfg.extraction.validation_pass,
+                )
+            except LLMResponseError as e:
+                typer.echo(f"Warning: session #{session.id} failed: {e}")
+                n_failed += 1
+                continue
 
-        store.replace_session_statements(conn, session.id, statements)
-        n_processed += 1
-        n_extracted += len(statements)
+            statements, dropped = dedup_statements(
+                statements, seen_embeddings, cfg.extraction.dedup_threshold
+            )
+            seen_embeddings.extend(s.embedding for s in statements if s.embedding is not None)
 
-    conn.commit()
+            store.replace_session_statements(conn, session.id, statements)
+            store.mark_session_extracted(conn, session.id, _now_iso())
+            if statements and not store.get_meta(conn, "embedding_dim"):
+                store.set_meta(conn, "embedding_model", cfg.llm.embedding_model)
+                store.set_meta(conn, "embedding_dim", str(len(statements[0].embedding or [])))
+            # Commit per session so an interrupted run resumes from here
+            # instead of discarding everything.
+            conn.commit()
+
+            n_processed += 1
+            n_extracted += len(statements)
+            n_deduped += dropped
+            typer.echo(
+                f"[{i}/{total}] session #{session.id} {session.thread_id}: "
+                f"{len(statements)} statements"
+                + (f" ({dropped} deduped)" if dropped else "")
+            )
+    except KeyboardInterrupt:
+        interrupted = True
+
+    if interrupted:
+        typer.echo("\nInterrupted -- progress was saved; re-run `chatmem extract` to resume.")
 
     typer.echo(
         f"sessions:   {n_processed} processed, {n_skipped} skipped (target absent), "
-        f"{n_failed} failed"
+        f"{n_done} already extracted, {n_failed} failed"
     )
-    typer.echo(f"statements: {n_extracted} extracted")
+    typer.echo(f"statements: {n_extracted} extracted, {n_deduped} deduped")
+
+    if interrupted:
+        raise typer.Exit(code=130)
 
 
 @app.command()
 def query(
     question: str = typer.Argument(..., help="A natural-language question about the target."),
     limit: int = typer.Option(5, "--limit"),
+    thread: Optional[str] = typer.Option(None, "--thread", help="Only search one thread."),
+    since: Optional[str] = typer.Option(
+        None, "--since", help="Only statements at or after this date (YYYY-MM-DD)."
+    ),
+    until: Optional[str] = typer.Option(
+        None, "--until", help="Only statements at or before this date (YYYY-MM-DD)."
+    ),
+    min_score: Optional[float] = typer.Option(
+        None, "--min-score", help="Drop results scoring below this similarity."
+    ),
+    answer: bool = typer.Option(
+        False, "--answer", help="Also compose an answer from the results, with citations."
+    ),
     config: Path = typer.Option(Path("config.yaml"), "--config"),
     target: Optional[str] = typer.Option(
         None, "--target", help="Override config.yaml's target for this run."
@@ -357,6 +608,18 @@ def query(
     if not cfg.llm.embedding_model:
         typer.echo("Error: llm.embedding_model is not set in config.yaml.", err=True)
         raise typer.Exit(code=1)
+    if answer and not cfg.llm.chat_model:
+        typer.echo(
+            "Error: llm.chat_model is not set in config.yaml -- required for --answer.", err=True
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        since_ts = _parse_when(since, end=False)
+        until_ts = _parse_when(until, end=True)
+    except ValueError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(code=1)
 
     conn = store.connect(cfg.db_path)
 
@@ -367,21 +630,62 @@ def query(
         )
         raise typer.Exit(code=1)
 
-    statements = store.list_statements(conn, person_id=target_person_id)
+    stored_model = store.get_meta(conn, "embedding_model")
+    if stored_model is not None and stored_model != cfg.llm.embedding_model:
+        typer.echo(
+            f"Error: stored statements were embedded with {stored_model!r}, but config.yaml "
+            f"says {cfg.llm.embedding_model!r}. Scores against a different model's vectors "
+            "are meaningless -- re-embed with `chatmem extract --force`.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    statements = store.list_statements(conn, person_id=target_person_id, thread_id=thread)
     embedded = [s for s in statements if s.embedding is not None]
     if not embedded:
         typer.echo("No embedded statements found. Run `chatmem extract` first.")
         raise typer.Exit(code=0)
 
+    # A statement covers a span, so it matches a window if the two overlap.
+    if since_ts is not None:
+        embedded = [s for s in embedded if s.end_ts >= since_ts]
+    if until_ts is not None:
+        embedded = [s for s in embedded if s.start_ts <= until_ts]
+    if not embedded:
+        typer.echo("No statements fall in that range.")
+        return
+
+    # Cosine similarity zips the two vectors, so vectors of different lengths
+    # would score against a truncated prefix instead of failing. That can only
+    # happen if an `extract --force` after a model change was interrupted.
+    dims = {len(s.embedding) for s in embedded}
+    if len(dims) > 1:
+        typer.echo(
+            f"Error: stored statements have mixed embedding sizes {sorted(dims)}, so they "
+            "were not all embedded with the same model. Re-embed with "
+            "`chatmem extract --force`.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
     llm = LLMClient(cfg.llm)
-    results = run_query(question, embedded, llm, limit=limit)
+    results = run_query(question, embedded, llm, limit=limit, min_score=min_score)
 
     if not results:
         typer.echo("No matching statements found.")
         return
 
-    for statement, score in results:
-        typer.echo(f"[{score:.3f}] {statement.text}")
+    if answer:
+        try:
+            composed = llm.synthesize_answer(question, [s.text for s, _ in results])
+        except LLMResponseError as e:
+            typer.echo(f"Warning: could not compose an answer: {e}")
+        else:
+            typer.echo(composed)
+            typer.echo("")
+
+    for i, (statement, score) in enumerate(results, start=1):
+        typer.echo(f"[{i}] [{score:.3f}] {statement.text}")
         typer.echo(f"    {statement.thread_id}  {statement.start_ts} .. {statement.end_ts}")
         for m in store.messages_by_ids(conn, statement.source_message_ids):
             typer.echo(f"    > {m.sender}: {m.text}")

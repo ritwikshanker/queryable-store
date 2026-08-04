@@ -69,6 +69,10 @@ class Session:
     start_ts: str
     end_ts: str
     message_count: int
+    # When `chatmem extract` last processed this session (ISO-8601), or None
+    # if it never has. Lets extract resume without redoing sessions, even
+    # ones that legitimately produced zero statements.
+    extracted_at: str | None = None
 
 
 @dataclass(frozen=True)

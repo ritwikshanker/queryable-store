@@ -1,5 +1,5 @@
-from chatmem.extract import build_transcript, extract_session
-from chatmem.models import Message, Session
+from chatmem.extract import build_transcript, dedup_statements, extract_session
+from chatmem.models import Message, Session, Statement
 
 
 def _msg(id_, sender, person_id, seq, ts_ms, text="hi", media_type=None):
@@ -35,6 +35,7 @@ class FakeLLM:
     def __init__(self, statements, supported=None):
         self._statements = statements
         self._supported = supported
+        self.embed_calls = 0
 
     def extract_statements(self, transcript, target_name):
         return self._statements
@@ -42,9 +43,10 @@ class FakeLLM:
     def validate_statements(self, transcript, target_name, statements):
         return self._supported
 
-    def embed(self, text):
+    def embed(self, texts):
         # Deterministic and distinct per input, just enough to assert on.
-        return [float(len(text))]
+        self.embed_calls += 1
+        return [[float(len(t))] for t in texts]
 
 
 def test_build_transcript_numbers_lines_and_labels_media():
@@ -125,3 +127,69 @@ def test_extract_session_skips_validation_call_when_disabled():
         _session(0, 0), messages, "target", "Alex Rivera", llm, NAMES, validation_pass=False
     )
     assert [s.text for s in result] == ["Likes hiking"]
+
+
+def test_extract_session_embeds_all_statements_in_one_call():
+    messages = [_msg("m0", "Alex Rivera", "target", 0, 0, text="I like hiking")]
+    llm = FakeLLM(
+        statements=[
+            {"text": "Likes hiking", "message_indices": [0]},
+            {"text": "Lives in Berlin", "message_indices": [0]},
+            {"text": "Works as a nurse", "message_indices": [0]},
+        ]
+    )
+    result = extract_session(_session(0, 0), messages, "target", "Alex Rivera", llm, NAMES)
+
+    # One batched round-trip for the session, not one per statement.
+    assert llm.embed_calls == 1
+    assert [s.embedding for s in result] == [[12.0], [15.0], [16.0]]
+
+
+def test_extract_session_makes_no_embed_call_when_nothing_extracted():
+    messages = [_msg("m0", "Alex Rivera", "target", 0, 0)]
+    llm = FakeLLM(statements=[])
+    assert extract_session(_session(0, 0), messages, "target", "Alex Rivera", llm, NAMES) == []
+    assert llm.embed_calls == 1  # called with an empty batch, which short-circuits
+
+
+def _stmt(text, embedding):
+    return Statement(
+        id=None,
+        person_id="target",
+        session_id=1,
+        thread_id="t1",
+        text=text,
+        source_message_ids=[],
+        start_ts="1970-01-01T00:00:00.000000Z",
+        end_ts="1970-01-01T00:00:01.000000Z",
+        created_at="1970-01-01T00:00:02.000000Z",
+        embedding=embedding,
+    )
+
+
+def test_dedup_statements_drops_restatements_of_existing_ones():
+    new = [_stmt("Lives in Berlin", [1.0, 0.0]), _stmt("Works as a nurse", [0.0, 1.0])]
+    kept, dropped = dedup_statements(new, existing=[[1.0, 0.0]], threshold=0.92)
+    assert [s.text for s in kept] == ["Works as a nurse"]
+    assert dropped == 1
+
+
+def test_dedup_statements_drops_duplicates_within_the_same_batch():
+    new = [_stmt("Lives in Berlin", [1.0, 0.0]), _stmt("Berlin is home", [1.0, 0.0])]
+    kept, dropped = dedup_statements(new, existing=[], threshold=0.92)
+    assert [s.text for s in kept] == ["Lives in Berlin"]
+    assert dropped == 1
+
+
+def test_dedup_statements_keeps_statements_below_threshold():
+    new = [_stmt("Lives in Berlin", [1.0, 0.1])]
+    kept, dropped = dedup_statements(new, existing=[[0.0, 1.0]], threshold=0.92)
+    assert [s.text for s in kept] == ["Lives in Berlin"]
+    assert dropped == 0
+
+
+def test_dedup_statements_disabled_by_non_positive_threshold():
+    new = [_stmt("a", [1.0, 0.0]), _stmt("b", [1.0, 0.0])]
+    kept, dropped = dedup_statements(new, existing=[[1.0, 0.0]], threshold=0)
+    assert len(kept) == 2
+    assert dropped == 0

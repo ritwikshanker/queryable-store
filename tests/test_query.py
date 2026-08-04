@@ -21,8 +21,8 @@ class FakeLLM:
     def __init__(self, embedding):
         self._embedding = embedding
 
-    def embed(self, text):
-        return self._embedding
+    def embed(self, texts):
+        return [self._embedding for _ in texts]
 
 
 def test_cosine_similarity_identical_vectors_is_one():
@@ -65,3 +65,15 @@ def test_query_embeds_question_and_ranks_statements():
     llm = FakeLLM(embedding=[1.0, 0.0])
     results = query("some question", [match, other], llm, limit=1)
     assert [s.text for s, _ in results] == ["relevant"]
+
+
+def test_rank_statements_applies_min_score_before_limit():
+    close = _statement("close match", [1.0, 0.0])
+    far = _statement("far match", [0.0, 1.0])
+    results = rank_statements([1.0, 0.0], [close, far], limit=10, min_score=0.5)
+    # The weak match is dropped outright rather than filling a free slot.
+    assert [s.text for s, _ in results] == ["close match"]
+
+
+def test_rank_statements_min_score_can_exclude_everything():
+    assert rank_statements([1.0, 0.0], [_statement("s", [0.0, 1.0])], limit=5, min_score=0.5) == []

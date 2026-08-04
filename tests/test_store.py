@@ -1,3 +1,5 @@
+import pytest
+
 from chatmem import store
 from chatmem.config import IdentitySpec
 from chatmem.identity import IdentityResolver
@@ -103,6 +105,91 @@ def test_connect_migrates_v2_db_adding_embedding_column(tmp_path):
     assert stmt_row["embedding"] is None
 
 
+def test_connect_migrates_v3_db_packing_embeddings_and_backfilling_extracted_at(tmp_path):
+    import json
+    import sqlite3
+
+    db_path = tmp_path / "chatmem.db"
+    vec = [0.5, -0.25, 0.125]
+    # A Phase-3 (schema_version=3) database: embeddings are JSON text and
+    # sessions have no extracted_at column.
+    v3_conn = sqlite3.connect(str(db_path))
+    v3_conn.executescript(
+        """
+        CREATE TABLE people (person_id TEXT PRIMARY KEY, display_name TEXT NOT NULL, origin TEXT NOT NULL);
+        CREATE TABLE aliases (alias_norm TEXT PRIMARY KEY, raw_name TEXT NOT NULL, person_id TEXT NOT NULL);
+        CREATE TABLE threads (thread_id TEXT PRIMARY KEY, title TEXT, participants TEXT, source TEXT NOT NULL, ingested_at TEXT NOT NULL);
+        CREATE TABLE messages (id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, sender TEXT NOT NULL, person_id TEXT NOT NULL, timestamp_utc TEXT NOT NULL, timestamp_ms INTEGER NOT NULL, text TEXT, media_type TEXT, seq INTEGER NOT NULL);
+        CREATE TABLE sessions (id INTEGER PRIMARY KEY, thread_id TEXT NOT NULL, start_seq INTEGER NOT NULL, end_seq INTEGER NOT NULL, start_ts TEXT NOT NULL, end_ts TEXT NOT NULL, message_count INTEGER NOT NULL);
+        CREATE TABLE session_participants (session_id INTEGER NOT NULL, person_id TEXT NOT NULL, PRIMARY KEY (session_id, person_id));
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE statements (id INTEGER PRIMARY KEY, person_id TEXT NOT NULL, session_id INTEGER NOT NULL, thread_id TEXT NOT NULL, text TEXT NOT NULL, source_message_ids TEXT NOT NULL, start_ts TEXT NOT NULL, end_ts TEXT NOT NULL, created_at TEXT NOT NULL, embedding TEXT);
+        INSERT INTO meta (key, value) VALUES ('schema_version', '3');
+        INSERT INTO people (person_id, display_name, origin) VALUES ('pA', 'A', 'auto');
+        INSERT INTO threads (thread_id, title, participants, source, ingested_at) VALUES ('t1', 'T', '[]', 'instagram', '1970-01-01T00:00:00.000000Z');
+        INSERT INTO sessions (id, thread_id, start_seq, end_seq, start_ts, end_ts, message_count)
+            VALUES (1, 't1', 0, 1, '1970-01-01T00:00:00.000000Z', '1970-01-01T00:00:01.000000Z', 2);
+        INSERT INTO sessions (id, thread_id, start_seq, end_seq, start_ts, end_ts, message_count)
+            VALUES (2, 't1', 2, 3, '1970-01-01T00:00:02.000000Z', '1970-01-01T00:00:03.000000Z', 2);
+        """
+    )
+    v3_conn.execute(
+        "INSERT INTO statements (person_id, session_id, thread_id, text, source_message_ids, "
+        "start_ts, end_ts, created_at, embedding) VALUES ('pA', 1, 't1', 'hi', '[]', "
+        "'1970-01-01T00:00:00.000000Z', '1970-01-01T00:00:00.000000Z', "
+        "'2024-05-05T00:00:00.000000Z', ?)",
+        (json.dumps(vec),),
+    )
+    v3_conn.commit()
+    v3_conn.close()
+
+    conn = store.connect(db_path)
+    row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+    assert row["value"] == str(store.SCHEMA_VERSION)
+
+    # The JSON embedding became a packed BLOB with the same values.
+    stmt = store.list_statements(conn)[0]
+    assert stmt.text == "hi"
+    assert stmt.embedding == vec
+    assert isinstance(
+        conn.execute("SELECT embedding FROM statements").fetchone()["embedding"], bytes
+    )
+
+    # Sessions that already had statements are marked extracted; others aren't.
+    by_id = {s.id: s for s in store.list_sessions(conn)}
+    assert by_id[1].extracted_at == "2024-05-05T00:00:00.000000Z"
+    assert by_id[2].extracted_at is None
+
+
+def test_pack_unpack_embedding_round_trip():
+    vec = [0.5, -0.25, 0.125, 0.0]
+    assert store._unpack_embedding(store._pack_embedding(vec)) == vec
+    assert store._pack_embedding([]) == b""
+    assert store._unpack_embedding(b"") == []
+
+
+def test_meta_get_and_set(tmp_path):
+    conn = store.connect(tmp_path / "chatmem.db")
+    assert store.get_meta(conn, "embedding_model") is None
+    store.set_meta(conn, "embedding_model", "model-a")
+    assert store.get_meta(conn, "embedding_model") == "model-a"
+    store.set_meta(conn, "embedding_model", "model-b")
+    assert store.get_meta(conn, "embedding_model") == "model-b"
+
+
+def test_mark_session_extracted(tmp_path):
+    conn = store.connect(tmp_path / "chatmem.db")
+    store.upsert_thread(conn, "t1", "T", [], "instagram", "1970-01-01T00:00:00.000000Z")
+    _ensure_people(conn, "pA")
+    msgs = [_msg("m0", "t1", "A", "pA", 0, 0), _msg("m1", "t1", "A", "pA", 1, 1)]
+    store.replace_thread_messages(conn, "t1", msgs)
+    sessions = store.replace_thread_sessions(conn, "t1", [(0, 1)], {m.seq: m for m in msgs})
+    assert sessions[0].extracted_at is None
+
+    store.mark_session_extracted(conn, sessions[0].id, "2024-01-01T00:00:00.000000Z")
+    assert store.list_sessions(conn)[0].extracted_at == "2024-01-01T00:00:00.000000Z"
+
+
 def test_thread_and_message_round_trip(tmp_path):
     conn = store.connect(tmp_path / "chatmem.db")
     store.upsert_thread(conn, "t1", "Title", ["A", "B"], "instagram", "2024-01-01T00:00:00Z")
@@ -150,11 +237,129 @@ def test_save_identities_and_relink(tmp_path):
     resolver2 = IdentityResolver(
         [IdentitySpec(id="target", display_name="Real Name", aliases=["Old Name"])]
     )
-    n = store.relink_messages(conn, resolver2)
-    assert n == 1
+    result = store.relink_messages(conn, resolver2)
+    assert result.messages == 1
 
     loaded = store.thread_messages(conn, "t1")
     assert loaded[0].person_id == "target"
+
+
+def test_relink_rebuilds_participants_and_reattributes_statements(tmp_path):
+    conn = store.connect(tmp_path / "chatmem.db")
+    store.upsert_thread(conn, "t1", None, [], "instagram", "2024-01-01T00:00:00Z")
+
+    resolver = IdentityResolver([])
+    pid_old = resolver.resolve("Old Name")
+    store.save_identities(conn, resolver)
+    msgs = [_msg("id0", "t1", "Old Name", pid_old, 0, 0)]
+    store.replace_thread_messages(conn, "t1", msgs)
+    [session] = store.replace_thread_sessions(conn, "t1", [(0, 0)], {m.seq: m for m in msgs})
+    store.replace_session_statements(
+        conn, session.id, [_statement(session.id, person_id=pid_old, source_ids=["id0"])]
+    )
+    conn.commit()
+
+    resolver2 = IdentityResolver(
+        [IdentitySpec(id="target", display_name="Real Name", aliases=["Old Name"])]
+    )
+    result = store.relink_messages(conn, resolver2)
+
+    assert result.messages == 1
+    assert result.statements == 1
+    assert result.ambiguous_session_ids == []
+    # The statement follows the message to the new person, so `query
+    # --target target` still finds it.
+    assert store.list_statements(conn, person_id="target")[0].source_message_ids == ["id0"]
+    assert store.session_participant_ids(conn, session.id) == {"target"}
+
+
+def test_relink_flags_sessions_when_one_person_splits(tmp_path):
+    conn = store.connect(tmp_path / "chatmem.db")
+    store.upsert_thread(conn, "t1", None, [], "instagram", "2024-01-01T00:00:00Z")
+
+    # Two different raw senders initially collapsed onto one person...
+    resolver = IdentityResolver(
+        [IdentitySpec(id="both", display_name="Both", aliases=["Ana", "Bea"])]
+    )
+    pid = resolver.resolve("Ana")
+    store.save_identities(conn, resolver)
+    msgs = [_msg("id0", "t1", "Ana", pid, 0, 0), _msg("id1", "t1", "Bea", pid, 1, 1)]
+    store.replace_thread_messages(conn, "t1", msgs)
+    [session] = store.replace_thread_sessions(conn, "t1", [(0, 1)], {m.seq: m for m in msgs})
+    store.replace_session_statements(
+        conn, session.id, [_statement(session.id, person_id=pid, source_ids=["id0"])]
+    )
+    conn.commit()
+
+    # ...are now declared as two people. Which one the statement belongs to
+    # can't be decided here, so the session is reported for re-extraction.
+    resolver2 = IdentityResolver(
+        [
+            IdentitySpec(id="ana", display_name="Ana", aliases=["Ana"]),
+            IdentitySpec(id="bea", display_name="Bea", aliases=["Bea"]),
+        ]
+    )
+    result = store.relink_messages(conn, resolver2)
+
+    assert result.statements == 0
+    assert result.ambiguous_session_ids == [session.id]
+    assert store.session_participant_ids(conn, session.id) == {"ana", "bea"}
+
+
+def test_replace_thread_content_preserves_statements_when_unchanged(tmp_path):
+    conn = store.connect(tmp_path / "chatmem.db")
+    store.upsert_thread(conn, "t1", None, [], "instagram", "2024-01-01T00:00:00Z")
+    _ensure_people(conn, "pA")
+    msgs = [_msg("id0", "t1", "A", "pA", 0, 0), _msg("id1", "t1", "A", "pA", 1, 1)]
+    by_seq = {m.seq: m for m in msgs}
+
+    sessions, preserved = store.replace_thread_content(conn, "t1", msgs, [(0, 1)], by_seq)
+    assert preserved == 0
+    store.replace_session_statements(
+        conn,
+        sessions[0].id,
+        [_statement(sessions[0].id, source_ids=["id0"], embedding=[0.5, 0.25])],
+    )
+    store.mark_session_extracted(conn, sessions[0].id, "2024-05-05T00:00:00.000000Z")
+    conn.commit()
+
+    # Re-ingesting the same archive must not raise (statements reference
+    # sessions that get rebuilt) and must not discard the extraction.
+    sessions2, preserved2 = store.replace_thread_content(conn, "t1", msgs, [(0, 1)], by_seq)
+    conn.commit()
+
+    assert preserved2 == 1
+    kept = store.list_statements(conn, person_id="pA")
+    assert len(kept) == 1
+    assert kept[0].session_id == sessions2[0].id
+    assert kept[0].embedding == pytest.approx([0.5, 0.25])
+    assert store.list_sessions(conn)[0].extracted_at == "2024-05-05T00:00:00.000000Z"
+
+
+def test_replace_thread_content_drops_statements_when_messages_change(tmp_path):
+    conn = store.connect(tmp_path / "chatmem.db")
+    store.upsert_thread(conn, "t1", None, [], "instagram", "2024-01-01T00:00:00Z")
+    _ensure_people(conn, "pA")
+    msgs = [_msg("id0", "t1", "A", "pA", 0, 0), _msg("id1", "t1", "A", "pA", 1, 1)]
+    by_seq = {m.seq: m for m in msgs}
+    sessions, _ = store.replace_thread_content(conn, "t1", msgs, [(0, 1)], by_seq)
+    store.replace_session_statements(
+        conn, sessions[0].id, [_statement(sessions[0].id, source_ids=["id0"])]
+    )
+    store.mark_session_extracted(conn, sessions[0].id, "2024-05-05T00:00:00.000000Z")
+    conn.commit()
+
+    # A cited message's content changed, so its id changed -- the statement
+    # can no longer be trusted and the session goes back to unextracted.
+    edited = [_msg("id0-edited", "t1", "A", "pA", 0, 0, text="different"), msgs[1]]
+    _sessions, preserved = store.replace_thread_content(
+        conn, "t1", edited, [(0, 1)], {m.seq: m for m in edited}
+    )
+    conn.commit()
+
+    assert preserved == 0
+    assert store.list_statements(conn, person_id="pA") == []
+    assert store.list_sessions(conn)[0].extracted_at is None
 
 
 def test_sessions_round_trip_with_participants(tmp_path):
@@ -247,7 +452,11 @@ def test_statement_embedding_round_trips_and_defaults_to_none(tmp_path):
         conn, session.id, [_statement(session.id, text="embedded", embedding=[0.1, 0.2, 0.3])]
     )
     conn.commit()
-    assert store.list_statements(conn, person_id="pA")[0].embedding == [0.1, 0.2, 0.3]
+    # Stored as packed float32, so values come back with float32 precision --
+    # irrelevant to cosine ranking, which is all embeddings are used for.
+    assert store.list_statements(conn, person_id="pA")[0].embedding == pytest.approx(
+        [0.1, 0.2, 0.3]
+    )
 
 
 def test_messages_by_ids_preserves_order_and_skips_missing(tmp_path):

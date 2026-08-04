@@ -21,19 +21,30 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
 
 
 def rank_statements(
-    query_embedding: list[float], statements: list[Statement], limit: int
+    query_embedding: list[float],
+    statements: list[Statement],
+    limit: int,
+    min_score: float | None = None,
 ) -> list[tuple[Statement, float]]:
+    """Rank by similarity, then cut. min_score is applied before the limit, so
+    a weak match never fills a slot just because nothing better exists."""
     scored = [
         (s, cosine_similarity(query_embedding, s.embedding))
         for s in statements
         if s.embedding is not None
     ]
+    if min_score is not None:
+        scored = [pair for pair in scored if pair[1] >= min_score]
     scored.sort(key=lambda pair: pair[1], reverse=True)
     return scored[:limit]
 
 
 def query(
-    question: str, statements: list[Statement], llm: LLMClient, limit: int = 5
+    question: str,
+    statements: list[Statement],
+    llm: LLMClient,
+    limit: int = 5,
+    min_score: float | None = None,
 ) -> list[tuple[Statement, float]]:
-    query_embedding = llm.embed(question)
-    return rank_statements(query_embedding, statements, limit)
+    [query_embedding] = llm.embed([question])
+    return rank_statements(query_embedding, statements, limit, min_score=min_score)

@@ -222,3 +222,24 @@ def test_synthetic_archive_fixture(synthetic_archive):
     assert beta.dropped == {}
     assert len(beta.messages) == 5
     assert set(beta.participants) == {"Alex R.", "Sam Chen"}
+
+
+def test_messages_without_usable_timestamps_are_dropped_not_dated_to_1970(tmp_path):
+    thread_dir = tmp_path / "thread"
+    _write(
+        thread_dir,
+        "message_1.json",
+        ["A", "B"],
+        [
+            _base_msg("A", 3000, content="real"),
+            {"sender_name": "A", "content": "no timestamp at all"},
+            {"sender_name": "A", "timestamp_ms": "oops", "content": "bad type"},
+            {"sender_name": "A", "timestamp_ms": 0, "content": "epoch zero"},
+        ],
+    )
+    [thread] = list(InstagramParser().parse(thread_dir))
+
+    # Kept messages are only the ones that can be placed in time; the rest
+    # are reported rather than silently sorted to 1970.
+    assert [m.text for m in thread.messages] == ["real"]
+    assert thread.dropped["missing_timestamp"] == 3

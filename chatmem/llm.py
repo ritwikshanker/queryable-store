@@ -6,9 +6,10 @@ from __future__ import annotations
 
 import json
 
-from openai import OpenAI
+from openai import OpenAI, OpenAIError
 
 from chatmem.config import LLMConfig
+from chatmem.prompts import answer as answer_prompt
 from chatmem.prompts import extract as extract_prompt
 from chatmem.prompts import validate as validate_prompt
 
@@ -47,17 +48,22 @@ class LLMClient:
             )
         last_error: Exception | None = None
         for _ in range(max(1, self._config.max_retries)):
-            response = self._client.chat.completions.create(
-                model=self._config.chat_model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message},
-                ],
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {"name": schema_name, "schema": schema},
-                },
-            )
+            try:
+                response = self._client.chat.completions.create(
+                    model=self._config.chat_model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_message},
+                    ],
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {"name": schema_name, "schema": schema},
+                    },
+                )
+            except OpenAIError as e:
+                # Surfaced as our own error so callers (cli.extract) can keep
+                # going on a flaky server without importing the OpenAI SDK.
+                raise LLMResponseError(f"chat request failed: {e}") from e
             content = response.choices[0].message.content or ""
             try:
                 return json.loads(content)
@@ -135,11 +141,55 @@ class LLMClient:
         }
         return [supported_by_index.get(i, False) for i in range(len(statements))]
 
-    def embed(self, text: str) -> list[float]:
+    def synthesize_answer(self, question: str, statements: list[str]) -> str:
+        """Compose a prose answer from retrieved statements.
+
+        Free text rather than JSON: the answer itself is the product, and the
+        [n] citation markers refer to the same numbering the CLI prints.
+        """
+        if not self._config.chat_model:
+            raise LLMConfigError(
+                "llm.chat_model is not set in config.yaml -- required to synthesize an answer."
+            )
+        try:
+            response = self._client.chat.completions.create(
+                model=self._config.chat_model,
+                messages=[
+                    {"role": "system", "content": answer_prompt.SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": answer_prompt.build_user_message(question, statements),
+                    },
+                ],
+            )
+        except OpenAIError as e:
+            raise LLMResponseError(f"chat request failed: {e}") from e
+        return (response.choices[0].message.content or "").strip()
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        """Embed a batch of texts in one call, returned in input order.
+
+        Batched rather than one-at-a-time because extraction embeds every
+        statement in a session -- one round-trip per statement was the
+        dominant cost of `chatmem extract`.
+        """
         if not self._config.embedding_model:
             raise LLMConfigError(
                 "llm.embedding_model is not set in config.yaml -- set it to an embedding "
                 "model id served by your LM Studio instance."
             )
-        response = self._client.embeddings.create(model=self._config.embedding_model, input=text)
-        return list(response.data[0].embedding)
+        if not texts:
+            return []
+        try:
+            response = self._client.embeddings.create(
+                model=self._config.embedding_model, input=texts
+            )
+        except OpenAIError as e:
+            raise LLMResponseError(f"embedding request failed: {e}") from e
+        # The API doesn't promise response order matches input order.
+        by_index = {d.index: list(d.embedding) for d in response.data}
+        if len(by_index) != len(texts):
+            raise LLMResponseError(
+                f"expected {len(texts)} embeddings, got {len(by_index)}"
+            )
+        return [by_index[i] for i in range(len(texts))]

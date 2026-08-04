@@ -104,9 +104,17 @@ def _load_json(path: Path) -> dict[str, Any]:
     return data
 
 
-def _timestamp_ms(raw: dict[str, Any]) -> int:
-    ts = raw.get("timestamp_ms", 0)
-    return ts if isinstance(ts, int) else 0
+def _timestamp_ms(raw: dict[str, Any]) -> int | None:
+    """The message's timestamp, or None if it is missing or unusable.
+
+    Coercing a missing timestamp to 0 would date the message to 1970, sort it
+    to the front of the thread, and distort the idle gaps sessionize() splits
+    on -- so callers drop these instead, counted like any other drop reason.
+    """
+    ts = raw.get("timestamp_ms")
+    if isinstance(ts, bool) or not isinstance(ts, int) or ts <= 0:
+        return None
+    return ts
 
 
 def _detect_media_type(raw: dict[str, Any]) -> str | None:
@@ -177,8 +185,9 @@ class InstagramParser:
         title: str | None = None
         participants: list[str] = []
         seen_participants: set[str] = set()
-        # (file_index, index_within_file, raw_message)
-        collected: list[tuple[int, int, dict[str, Any]]] = []
+        # (timestamp_ms, file_index, index_within_file, raw_message)
+        collected: list[tuple[int, int, int, dict[str, Any]]] = []
+        dropped: Counter[str] = Counter()
 
         for file_index, path in enumerate(files):
             data = _load_json(path)
@@ -197,18 +206,22 @@ class InstagramParser:
                     title = fix_mojibake(raw_title)
 
             for index_within_file, raw in enumerate(data.get("messages") or []):
-                if isinstance(raw, dict):
-                    collected.append((file_index, index_within_file, raw))
+                if not isinstance(raw, dict):
+                    continue
+                ts = _timestamp_ms(raw)
+                if ts is None:
+                    dropped["missing_timestamp"] += 1
+                    continue
+                collected.append((ts, file_index, index_within_file, raw))
 
         # Ascending by timestamp; ties broken so that within-file order
         # (newest-first) is reversed back into chronological order, and
         # earlier files win ties against later ones.
-        collected.sort(key=lambda t: (_timestamp_ms(t[2]), t[0], -t[1]))
+        collected.sort(key=lambda t: (t[0], t[1], -t[2]))
 
         messages: list[RawMessage] = []
-        dropped: Counter[str] = Counter()
 
-        for ordinal, (_file_index, _idx, raw) in enumerate(collected):
+        for ordinal, (ts, _file_index, _idx, raw) in enumerate(collected):
             raw_sender = raw.get("sender_name")
             sender = fix_mojibake(raw_sender) if isinstance(raw_sender, str) else "Unknown"
 
@@ -221,7 +234,7 @@ class InstagramParser:
                 RawMessage(
                     thread_id=thread_id,
                     sender=sender,
-                    timestamp_ms=_timestamp_ms(raw),
+                    timestamp_ms=ts,
                     text=text,
                     media_type=media_type,
                     ordinal=ordinal,

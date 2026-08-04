@@ -37,7 +37,9 @@ class LLMClient:
             timeout=config.timeout_seconds,
         )
 
-    def _chat_json(self, system_prompt: str, user_message: str) -> dict:
+    def _chat_json(
+        self, system_prompt: str, user_message: str, *, schema_name: str, schema: dict
+    ) -> dict:
         if not self._config.chat_model:
             raise LLMConfigError(
                 "llm.chat_model is not set in config.yaml -- set it to a chat model id "
@@ -51,7 +53,10 @@ class LLMClient:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_message},
                 ],
-                response_format={"type": "json_object"},
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {"name": schema_name, "schema": schema},
+                },
             )
             content = response.choices[0].message.content or ""
             try:
@@ -64,7 +69,29 @@ class LLMClient:
     def extract_statements(self, transcript: str, target_name: str) -> list[dict]:
         """Returns a list of {"text": str, "message_indices": [int, ...]} dicts."""
         user_message = extract_prompt.build_user_message(transcript, target_name)
-        data = self._chat_json(extract_prompt.SYSTEM_PROMPT, user_message)
+        schema = {
+            "type": "object",
+            "properties": {
+                "statements": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "text": {"type": "string"},
+                            "message_indices": {"type": "array", "items": {"type": "integer"}},
+                        },
+                        "required": ["text", "message_indices"],
+                    },
+                },
+            },
+            "required": ["statements"],
+        }
+        data = self._chat_json(
+            extract_prompt.SYSTEM_PROMPT,
+            user_message,
+            schema_name="extraction_result",
+            schema=schema,
+        )
         statements = data.get("statements", [])
         if not isinstance(statements, list):
             raise LLMResponseError(f"expected 'statements' to be a list, got {type(statements)!r}")
@@ -77,7 +104,29 @@ class LLMClient:
         if not statements:
             return []
         user_message = validate_prompt.build_user_message(transcript, target_name, statements)
-        data = self._chat_json(validate_prompt.SYSTEM_PROMPT, user_message)
+        schema = {
+            "type": "object",
+            "properties": {
+                "results": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "index": {"type": "integer"},
+                            "supported": {"type": "boolean"},
+                        },
+                        "required": ["index", "supported"],
+                    },
+                },
+            },
+            "required": ["results"],
+        }
+        data = self._chat_json(
+            validate_prompt.SYSTEM_PROMPT,
+            user_message,
+            schema_name="validation_result",
+            schema=schema,
+        )
         results = data.get("results", [])
         supported_by_index = {
             r["index"]: bool(r["supported"])

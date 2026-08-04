@@ -82,7 +82,8 @@ def test_extract_statements_parses_valid_json(monkeypatch):
     result = client.extract_statements("transcript text", "Alex")
     assert result == [{"text": "Works as a nurse", "message_indices": [0, 1]}]
     assert len(fake.calls) == 1
-    assert fake.calls[0]["response_format"] == {"type": "json_object"}
+    assert fake.calls[0]["response_format"]["type"] == "json_schema"
+    assert fake.calls[0]["response_format"]["json_schema"]["name"] == "extraction_result"
 
 
 def test_extract_statements_retries_on_bad_json_then_succeeds(monkeypatch):

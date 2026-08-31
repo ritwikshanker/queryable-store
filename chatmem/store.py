@@ -20,7 +20,7 @@ from chatmem.identity import IdentityResolver
 from chatmem.models import Message, Person, Session, Statement
 from chatmem.parsers.text import normalize_alias
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _SCHEMA_SQL = """
 CREATE TABLE people (
@@ -91,7 +91,8 @@ CREATE TABLE statements (
     start_ts           TEXT NOT NULL,
     end_ts             TEXT NOT NULL,
     created_at         TEXT NOT NULL,
-    embedding          BLOB  -- packed float32 vector; NULL until embedded
+    embedding          BLOB,  -- packed float32 vector; NULL until embedded
+    topic              TEXT   -- chatmem.topics key; NULL until `digest` classifies it
 );
 CREATE INDEX statements_person ON statements(person_id);
 CREATE INDEX statements_session ON statements(session_id);
@@ -198,6 +199,10 @@ _MIGRATIONS: dict[int, str | Callable[[sqlite3.Connection], None]] = {
     """,
     2: "ALTER TABLE statements ADD COLUMN embedding TEXT;",
     3: _migrate_v3_to_v4,
+    # Left NULL rather than backfilled: `chatmem digest` classifies exactly the
+    # statements whose topic is still NULL, so an existing database is picked
+    # up by the first digest run with no extra flag.
+    4: "ALTER TABLE statements ADD COLUMN topic TEXT;",
 }
 
 
@@ -654,8 +659,8 @@ def replace_session_statements(
     conn.executemany(
         "INSERT INTO statements "
         "(person_id, session_id, thread_id, text, source_message_ids, start_ts, end_ts, "
-        "created_at, embedding) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "created_at, embedding, topic) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
             (
                 s.person_id,
@@ -667,9 +672,46 @@ def replace_session_statements(
                 s.end_ts,
                 s.created_at,
                 _pack_embedding(s.embedding) if s.embedding is not None else None,
+                s.topic,
             )
             for s in statements
         ],
+    )
+
+
+def set_statement_topics(conn: sqlite3.Connection, topic_by_id: dict[int, str]) -> None:
+    """Assign topics to statements by id. Caller commits."""
+    conn.executemany(
+        "UPDATE statements SET topic = ? WHERE id = ?",
+        [(topic, sid) for sid, topic in topic_by_id.items()],
+    )
+
+
+def clear_statement_topics(conn: sqlite3.Connection, person_id: str | None = None) -> int:
+    """Reset topics so the next digest re-classifies from scratch -- needed
+    after the taxonomy in chatmem.topics changes. Returns rows affected."""
+    if person_id is None:
+        cur = conn.execute("UPDATE statements SET topic = NULL WHERE topic IS NOT NULL")
+    else:
+        cur = conn.execute(
+            "UPDATE statements SET topic = NULL WHERE topic IS NOT NULL AND person_id = ?",
+            (person_id,),
+        )
+    return cur.rowcount
+
+
+def set_statement_embeddings(
+    conn: sqlite3.Connection, embedding_by_id: dict[int, list[float]]
+) -> None:
+    """Replace statements' vectors in place. Caller commits.
+
+    Separate from replace_session_statements because re-embedding must not
+    disturb the statement rows themselves -- their ids are cited by the
+    digest and by anything the user has already read.
+    """
+    conn.executemany(
+        "UPDATE statements SET embedding = ? WHERE id = ?",
+        [(_pack_embedding(vec), sid) for sid, vec in embedding_by_id.items()],
     )
 
 
@@ -679,10 +721,11 @@ def list_statements(
     thread_id: str | None = None,
     session_id: int | None = None,
     limit: int | None = None,
+    untagged: bool = False,
 ) -> list[Statement]:
     sql = (
         "SELECT id, person_id, session_id, thread_id, text, source_message_ids, "
-        "start_ts, end_ts, created_at, embedding FROM statements"
+        "start_ts, end_ts, created_at, embedding, topic FROM statements"
     )
     clauses = []
     params: list[object] = []
@@ -695,6 +738,8 @@ def list_statements(
     if session_id is not None:
         clauses.append("session_id = ?")
         params.append(session_id)
+    if untagged:
+        clauses.append("topic IS NULL")
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)
     sql += " ORDER BY start_ts ASC"
@@ -714,6 +759,7 @@ def list_statements(
             end_ts=r["end_ts"],
             created_at=r["created_at"],
             embedding=_unpack_embedding(r["embedding"]) if r["embedding"] is not None else None,
+            topic=r["topic"],
         )
         for r in rows
     ]

@@ -40,6 +40,56 @@ def _client(monkeypatch, responses: list[str], max_retries: int = 3) -> tuple[LL
     return LLMClient(cfg), fake
 
 
+def test_classify_statements_returns_one_topic_per_statement_in_input_order(monkeypatch):
+    client, fake = _client(
+        monkeypatch,
+        ['{"assignments": [{"index": 1, "topic": "work"}, {"index": 0, "topic": "family"}]}'],
+    )
+    assert client.classify_statements(["has a sister", "is a nurse"]) == ["family", "work"]
+
+
+def test_classify_statements_makes_no_call_for_an_empty_batch(monkeypatch):
+    client, fake = _client(monkeypatch, [])
+    assert client.classify_statements([]) == []
+    assert fake.calls == []
+
+
+def test_classify_statements_falls_back_for_a_statement_the_model_skipped(monkeypatch):
+    """A missing assignment must not shift the others or drop the statement --
+    it renders under Unclassified and the next digest run retries it."""
+    from chatmem import topics
+
+    client, _ = _client(monkeypatch, ['{"assignments": [{"index": 0, "topic": "family"}]}'])
+    assert client.classify_statements(["a", "b"]) == ["family", topics.FALLBACK_KEY]
+
+
+def test_classify_statements_falls_back_for_a_topic_outside_the_taxonomy(monkeypatch):
+    from chatmem import topics
+
+    client, _ = _client(
+        monkeypatch, ['{"assignments": [{"index": 0, "topic": "not_a_real_topic"}]}']
+    )
+    assert client.classify_statements(["a"]) == [topics.FALLBACK_KEY]
+
+
+def test_classify_statements_constrains_the_topic_to_the_taxonomy_in_the_schema(monkeypatch):
+    """The enum is what keeps a well-behaved model inside the taxonomy; the
+    fallback above is only the backstop for one that isn't."""
+    from chatmem import topics
+
+    client, fake = _client(monkeypatch, ['{"assignments": []}'])
+    client.classify_statements(["a"])
+    schema = fake.calls[0]["response_format"]["json_schema"]["schema"]
+    enum = schema["properties"]["assignments"]["items"]["properties"]["topic"]["enum"]
+    assert enum == list(topics.TOPIC_KEYS)
+
+
+def test_classify_statements_rejects_a_non_list_assignments_field(monkeypatch):
+    client, _ = _client(monkeypatch, ['{"assignments": "family"}'])
+    with pytest.raises(LLMResponseError):
+        client.classify_statements(["a"])
+
+
 def test_construction_does_not_require_any_model_id(monkeypatch):
     """LLMClient is used for chat-only (extract) and embedding-only (query)
     work, so __init__ shouldn't demand both up front."""
@@ -141,3 +191,22 @@ def test_validate_statements_short_circuits_on_empty_input(monkeypatch):
     client = LLMClient(LLMConfig(chat_model="test-model"))
     assert client.validate_statements("t", "Alex", []) == []
     assert fake.calls == []
+
+
+def test_reasoning_effort_is_omitted_when_unset(monkeypatch):
+    """A server that doesn't know the parameter rejects the whole request, so
+    the default must not send it at all."""
+    client, fake = _client(monkeypatch, ['{"statements": []}'])
+    client.extract_statements("t", "Sam")
+    assert "reasoning_effort" not in fake.calls[0]
+
+
+def test_reasoning_effort_is_passed_through_when_set(monkeypatch):
+    fake = FakeClient(responses=['{"statements": []}', "an answer"])
+    monkeypatch.setattr(llm_module, "OpenAI", lambda **kwargs: fake)
+    client = LLMClient(LLMConfig(chat_model="test-model", reasoning_effort="none"))
+    client.extract_statements("t", "Sam")
+    client.synthesize_answer("q", ["s"])
+    # Both the JSON path and the free-text answer path, or extraction speeds up
+    # while `query --answer` silently keeps burning reasoning tokens.
+    assert [c["reasoning_effort"] for c in fake.calls] == ["none", "none"]

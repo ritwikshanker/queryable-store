@@ -6,6 +6,7 @@ from typer.testing import CliRunner
 
 from chatmem import cli, store
 from chatmem.cli import _message_id, app
+from chatmem.llm import LLMResponseError
 
 runner = CliRunner()
 
@@ -30,6 +31,12 @@ class _FakeLLM:
 
     def validate_statements(self, transcript, target_name, statements):
         return [True for _ in statements]
+
+    def classify_statements(self, statements):
+        # Spread across a couple of real topics so the digest renders more
+        # than one section; which topic a statement lands in is the model's
+        # job, not something these plumbing tests should assert.
+        return ["family" if i % 2 == 0 else "work" for i in range(len(statements))]
 
     def embed(self, texts):
         # A one-hot vector whose position is a stable hash of the text:
@@ -692,3 +699,245 @@ def test_query_refuses_mixed_embedding_sizes(
     )
     assert result.exit_code == 1
     assert "mixed embedding sizes" in result.output
+
+
+# --- digest --------------------------------------------------------------
+
+
+class _FailingClassifier(_FakeLLM):
+    """Classifies nothing: every batch raises, as a flaky server would."""
+
+    def classify_statements(self, statements):
+        raise LLMResponseError("boom")
+
+
+def test_digest_command_classifies_and_writes_every_statement(
+    tmp_path, synthetic_archive, extract_config_path, monkeypatch
+):
+    db_path = _seed_for_query(tmp_path, synthetic_archive, extract_config_path, monkeypatch)
+    out = tmp_path / "MEMORIES.md"
+
+    result = runner.invoke(
+        app, ["digest", "--out", str(out), "--config", str(extract_config_path), "--db", str(db_path)]
+    )
+    assert result.exit_code == 0, result.output
+
+    conn = store.connect(db_path)
+    stored = store.list_statements(conn, person_id="target")
+    assert stored and all(s.topic is not None for s in stored)
+
+    markdown = out.read_text(encoding="utf-8")
+    bullets = [line for line in markdown.splitlines() if line.startswith("- **")]
+    assert len(bullets) == len(stored)
+    assert f"wrote {len(stored)} memories" in result.output
+
+
+def test_digest_command_only_classifies_statements_it_has_not_seen(
+    tmp_path, synthetic_archive, extract_config_path, monkeypatch
+):
+    """Re-running after a new extract must cost one batch for the new rows,
+    not a full re-classification of the archive."""
+    db_path = _seed_for_query(tmp_path, synthetic_archive, extract_config_path, monkeypatch)
+    out = tmp_path / "MEMORIES.md"
+    args = ["digest", "--out", str(out), "--config", str(extract_config_path), "--db", str(db_path)]
+    runner.invoke(app, args)
+
+    seen: list[int] = []
+
+    class _CountingLLM(_FakeLLM):
+        def classify_statements(self, statements):
+            seen.append(len(statements))
+            return super().classify_statements(statements)
+
+    monkeypatch.setattr(cli, "LLMClient", _CountingLLM)
+    second = runner.invoke(app, args)
+    assert second.exit_code == 0, second.output
+    assert seen == []
+
+    third = runner.invoke(app, args + ["--reclassify"])
+    assert third.exit_code == 0, third.output
+    assert sum(seen) == len(store.list_statements(store.connect(db_path), person_id="target"))
+
+
+def test_digest_command_batches_by_batch_size(
+    tmp_path, synthetic_archive, extract_config_path, monkeypatch
+):
+    db_path = _seed_for_query(tmp_path, synthetic_archive, extract_config_path, monkeypatch)
+    sizes: list[int] = []
+
+    class _CountingLLM(_FakeLLM):
+        def classify_statements(self, statements):
+            sizes.append(len(statements))
+            return super().classify_statements(statements)
+
+    monkeypatch.setattr(cli, "LLMClient", _CountingLLM)
+    result = runner.invoke(
+        app,
+        ["digest", "--out", str(tmp_path / "M.md"), "--batch-size", "2",
+         "--config", str(extract_config_path), "--db", str(db_path)],
+    )
+    assert result.exit_code == 0, result.output
+    assert sizes and all(n <= 2 for n in sizes)
+    assert sum(sizes) == len(store.list_statements(store.connect(db_path), person_id="target"))
+
+
+def test_digest_command_still_writes_everything_when_classification_fails(
+    tmp_path, synthetic_archive, extract_config_path, monkeypatch
+):
+    """A dead classifier degrades the grouping, not the completeness -- and
+    leaves the rows untagged so the next run retries them."""
+    db_path = _seed_for_query(tmp_path, synthetic_archive, extract_config_path, monkeypatch)
+    monkeypatch.setattr(cli, "LLMClient", _FailingClassifier)
+    out = tmp_path / "MEMORIES.md"
+
+    result = runner.invoke(
+        app, ["digest", "--out", str(out), "--config", str(extract_config_path), "--db", str(db_path)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "left unclassified" in result.output
+
+    stored = store.list_statements(store.connect(db_path), person_id="target")
+    markdown = out.read_text(encoding="utf-8")
+    assert "## Unclassified" in markdown
+    assert len([line for line in markdown.splitlines() if line.startswith("- **")]) == len(stored)
+    assert all(s.topic is None for s in stored)
+
+
+def test_digest_command_quotes_source_messages_only_with_the_flag(
+    tmp_path, synthetic_archive, extract_config_path, monkeypatch
+):
+    db_path = _seed_for_query(tmp_path, synthetic_archive, extract_config_path, monkeypatch)
+    plain = tmp_path / "plain.md"
+    quoted = tmp_path / "quoted.md"
+
+    base = ["--config", str(extract_config_path), "--db", str(db_path)]
+    runner.invoke(app, ["digest", "--out", str(plain)] + base)
+    result = runner.invoke(app, ["digest", "--out", str(quoted), "--quotes"] + base)
+    assert result.exit_code == 0, result.output
+
+    assert "  > " not in plain.read_text(encoding="utf-8")
+    # Whoever sent the cited message -- the quote is of the source, which is
+    # not necessarily the target's own line.
+    assert "  > Sam Chen: hey you around?" in quoted.read_text(encoding="utf-8")
+
+
+def test_digest_command_errors_when_nothing_has_been_extracted(
+    tmp_path, synthetic_archive, extract_config_path, monkeypatch
+):
+    monkeypatch.setattr(cli, "LLMClient", _FakeLLM)
+    db_path = tmp_path / "chatmem.db"
+    runner.invoke(
+        app, ["ingest", str(synthetic_archive), "--config", str(extract_config_path), "--db", str(db_path)]
+    )
+    result = runner.invoke(
+        app, ["digest", "--out", str(tmp_path / "M.md"), "--config", str(extract_config_path),
+              "--db", str(db_path)]
+    )
+    assert result.exit_code == 1
+    assert "Run `chatmem extract` first" in result.output
+
+
+def test_digest_command_rejects_a_zero_batch_size(
+    tmp_path, synthetic_archive, extract_config_path, monkeypatch
+):
+    db_path = _seed_for_query(tmp_path, synthetic_archive, extract_config_path, monkeypatch)
+    result = runner.invoke(
+        app,
+        ["digest", "--out", str(tmp_path / "M.md"), "--batch-size", "0",
+         "--config", str(extract_config_path), "--db", str(db_path)],
+    )
+    assert result.exit_code == 1
+    assert "--batch-size" in result.output
+
+
+# --- reembed ---------------------------------------------------------------
+
+
+class _WideEmbedLLM(_FakeLLM):
+    """A "better" model: same texts, different (wider) vector space."""
+
+    def embed(self, texts):
+        return [[0.25] * 1024 for _ in texts]
+
+
+def test_reembed_replaces_vectors_without_re_running_extraction(
+    tmp_path, synthetic_archive, extract_config_path, monkeypatch
+):
+    """The whole point: swapping the embedding model must not cost the chat
+    pass again, and must not renumber statements that MEMORIES.md cites."""
+    db_path = _seed_for_query(tmp_path, synthetic_archive, extract_config_path, monkeypatch)
+    conn = store.connect(db_path)
+    before = store.list_statements(conn)
+    assert before and all(s.embedding is not None for s in before)
+    conn.close()
+
+    calls = []
+
+    class _NoChatLLM(_WideEmbedLLM):
+        def extract_statements(self, transcript, target_name):
+            calls.append("chat")
+            raise AssertionError("reembed must not call the chat model")
+
+    monkeypatch.setattr(cli, "LLMClient", _NoChatLLM)
+    monkeypatch.setattr(
+        cli, "_load_cfg", _cfg_with_embed_model(extract_config_path, "better-embed-model")
+    )
+    result = runner.invoke(app, ["reembed", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert calls == []
+
+    conn = store.connect(db_path)
+    after = store.list_statements(conn)
+    assert [s.id for s in after] == [s.id for s in before]
+    assert [s.text for s in after] == [s.text for s in before]
+    assert [s.topic for s in after] == [s.topic for s in before]
+    assert all(len(s.embedding) == 1024 for s in after)
+    assert store.get_meta(conn, "embedding_model") == "better-embed-model"
+    assert store.get_meta(conn, "embedding_dim") == "1024"
+
+
+def _cfg_with_embed_model(config_path, model):
+    from chatmem.config import LLMConfig, load_config
+
+    def loader(cp, db=None, target=None):
+        cfg = load_config(config_path).with_overrides(target=target, db_path=db)
+        llm = cfg.llm
+        return type(cfg)(
+            db_path=cfg.db_path,
+            target=cfg.target,
+            identities=cfg.identities,
+            llm=LLMConfig(
+                base_url=llm.base_url,
+                api_key=llm.api_key,
+                chat_model=llm.chat_model,
+                embedding_model=model,
+                timeout_seconds=llm.timeout_seconds,
+                max_retries=llm.max_retries,
+                reasoning_effort=llm.reasoning_effort,
+            ),
+            sessionize=cfg.sessionize,
+            extraction=cfg.extraction,
+        )
+
+    return loader
+
+
+def test_reembed_is_a_no_op_when_the_model_already_matches(
+    tmp_path, synthetic_archive, extract_config_path, monkeypatch
+):
+    db_path = _seed_for_query(tmp_path, synthetic_archive, extract_config_path, monkeypatch)
+    result = runner.invoke(
+        app, ["reembed", "--config", str(extract_config_path), "--db", str(db_path)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "already embedded" in result.output
+
+
+def test_reembed_errors_when_nothing_has_been_extracted(tmp_path, extract_config_path):
+    db_path = tmp_path / "empty.db"
+    store.connect(db_path).close()
+    result = runner.invoke(
+        app, ["reembed", "--config", str(extract_config_path), "--db", str(db_path)]
+    )
+    assert result.exit_code == 1
+    assert "Run `chatmem extract` first" in result.output

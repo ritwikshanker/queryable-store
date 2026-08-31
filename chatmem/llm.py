@@ -8,8 +8,10 @@ import json
 
 from openai import OpenAI, OpenAIError
 
+from chatmem import topics
 from chatmem.config import LLMConfig
 from chatmem.prompts import answer as answer_prompt
+from chatmem.prompts import classify as classify_prompt
 from chatmem.prompts import extract as extract_prompt
 from chatmem.prompts import validate as validate_prompt
 
@@ -38,6 +40,13 @@ class LLMClient:
             timeout=config.timeout_seconds,
         )
 
+    def _extra_chat_kwargs(self) -> dict:
+        """Only sent when configured: a server that doesn't know the parameter
+        rejects the whole request, so an unset value must not appear at all."""
+        if not self._config.reasoning_effort:
+            return {}
+        return {"reasoning_effort": self._config.reasoning_effort}
+
     def _chat_json(
         self, system_prompt: str, user_message: str, *, schema_name: str, schema: dict
     ) -> dict:
@@ -59,6 +68,7 @@ class LLMClient:
                         "type": "json_schema",
                         "json_schema": {"name": schema_name, "schema": schema},
                     },
+                    **self._extra_chat_kwargs(),
                 )
             except OpenAIError as e:
                 # Surfaced as our own error so callers (cli.extract) can keep
@@ -141,6 +151,55 @@ class LLMClient:
         }
         return [supported_by_index.get(i, False) for i in range(len(statements))]
 
+    def classify_statements(self, statements: list[str]) -> list[str]:
+        """File each statement under one topic key, same order as input.
+
+        A statement the model skipped, or filed under a key outside the
+        taxonomy, falls back to topics.FALLBACK_KEY rather than failing the
+        batch -- classification is presentational, and losing a whole batch of
+        real statements to one bad key would be the worse outcome.
+        """
+        if not statements:
+            return []
+        schema = {
+            "type": "object",
+            "properties": {
+                "assignments": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "index": {"type": "integer"},
+                            "topic": {"type": "string", "enum": list(topics.TOPIC_KEYS)},
+                        },
+                        "required": ["index", "topic"],
+                    },
+                },
+            },
+            "required": ["assignments"],
+        }
+        data = self._chat_json(
+            classify_prompt.SYSTEM_PROMPT,
+            classify_prompt.build_user_message(statements),
+            schema_name="classification_result",
+            schema=schema,
+        )
+        assignments = data.get("assignments", [])
+        if not isinstance(assignments, list):
+            raise LLMResponseError(
+                f"expected 'assignments' to be a list, got {type(assignments)!r}"
+            )
+        topic_by_index = {
+            a["index"]: a["topic"]
+            for a in assignments
+            if isinstance(a, dict)
+            and isinstance(a.get("index"), int)
+            and a.get("topic") in topics.BY_KEY
+        }
+        return [
+            topic_by_index.get(i, topics.FALLBACK_KEY) for i in range(len(statements))
+        ]
+
     def synthesize_answer(self, question: str, statements: list[str]) -> str:
         """Compose a prose answer from retrieved statements.
 
@@ -161,6 +220,7 @@ class LLMClient:
                         "content": answer_prompt.build_user_message(question, statements),
                     },
                 ],
+                **self._extra_chat_kwargs(),
             )
         except OpenAIError as e:
             raise LLMResponseError(f"chat request failed: {e}") from e

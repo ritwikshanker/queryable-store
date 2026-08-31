@@ -1,4 +1,4 @@
-"""chatmem CLI: ingest, identities, relink, stats, sessions, extract, query."""
+"""chatmem CLI: ingest, identities, relink, stats, sessions, extract, reembed, digest, query."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from typing import Optional
 
 import typer
 
+from chatmem import digest as digest_render
 from chatmem import store
 from chatmem.config import Config, load_config
 from chatmem.extract import dedup_statements, extract_session
@@ -375,6 +376,7 @@ def export(
             "start_ts": s.start_ts,
             "end_ts": s.end_ts,
             "created_at": s.created_at,
+            "topic": s.topic,
             "text": s.text,
             "source_message_ids": s.source_message_ids,
         }
@@ -411,6 +413,7 @@ _EXPORT_FIELDS = (
     "start_ts",
     "end_ts",
     "created_at",
+    "topic",
     "text",
     "source_message_ids",
 )
@@ -573,6 +576,203 @@ def extract(
 
     if interrupted:
         raise typer.Exit(code=130)
+
+
+@app.command()
+def reembed(
+    batch_size: int = typer.Option(64, "--batch-size", help="Statements per embedding call."),
+    force: bool = typer.Option(
+        False, "--force", help="Re-embed even if the stored model already matches config."
+    ),
+    config: Path = typer.Option(Path("config.yaml"), "--config"),
+    db: Optional[Path] = typer.Option(None, "--db"),
+) -> None:
+    """Re-embed stored statements with the configured embedding model.
+
+    For swapping in a better embedding model without paying for extraction
+    again: `extract --force` would redo the chat pass, which is the expensive
+    part and produces the same statements. This rewrites vectors in place, so
+    statement ids -- and anything citing them, like MEMORIES.md -- stay valid.
+
+    Deliberately whole-database: vectors from different models are not
+    comparable, so re-embedding only part of the store would leave `query`
+    ranking against a mix it cannot interpret.
+    """
+    cfg = _load_cfg(config, db=db)
+    if not cfg.llm.embedding_model:
+        typer.echo("Error: llm.embedding_model is not set in config.yaml.", err=True)
+        raise typer.Exit(code=1)
+    if batch_size < 1:
+        typer.echo("Error: --batch-size must be at least 1.", err=True)
+        raise typer.Exit(code=1)
+
+    conn = store.connect(cfg.db_path)
+    rows = store.list_statements(conn)
+    if not rows:
+        typer.echo("No statements found. Run `chatmem extract` first.")
+        raise typer.Exit(code=1)
+
+    stored_model = store.get_meta(conn, "embedding_model")
+    if stored_model == cfg.llm.embedding_model and not force:
+        missing = [s for s in rows if s.embedding is None]
+        if not missing:
+            typer.echo(
+                f"All {len(rows)} statements are already embedded with "
+                f"{cfg.llm.embedding_model!r}. Pass --force to redo them anyway."
+            )
+            return
+        rows = missing
+        typer.echo(f"embedding {len(rows)} statements that have no vector yet")
+    else:
+        typer.echo(
+            f"re-embedding {len(rows)} statements: "
+            f"{stored_model or 'none'!r} -> {cfg.llm.embedding_model!r}"
+        )
+
+    llm = LLMClient(cfg.llm)
+    total_batches = (len(rows) + batch_size - 1) // batch_size
+    n_done = 0
+    dim: int | None = None
+    try:
+        for b in range(total_batches):
+            batch = rows[b * batch_size : (b + 1) * batch_size]
+            try:
+                vectors = llm.embed([s.text for s in batch])
+            except LLMResponseError as e:
+                # Partial progress is committed but the model marker is not,
+                # so a resumed run re-embeds everything rather than leaving
+                # the store split across two models.
+                typer.echo(f"Error: embedding batch {b + 1} failed: {e}", err=True)
+                raise typer.Exit(code=1) from e
+            store.set_statement_embeddings(
+                conn, {s.id: v for s, v in zip(batch, vectors) if s.id is not None}
+            )
+            conn.commit()
+            dim = len(vectors[0]) if vectors else dim
+            n_done += len(batch)
+            typer.echo(f"[{b + 1}/{total_batches}] embedded {n_done}/{len(rows)}")
+    except KeyboardInterrupt:
+        typer.echo("\nInterrupted -- re-run `chatmem reembed` to finish.")
+        raise typer.Exit(code=130) from None
+
+    store.set_meta(conn, "embedding_model", cfg.llm.embedding_model)
+    if dim is not None:
+        store.set_meta(conn, "embedding_dim", str(dim))
+    conn.commit()
+    typer.echo(f"done: {n_done} statements embedded with {cfg.llm.embedding_model!r} (dim {dim})")
+
+
+@app.command()
+def digest(
+    out: Path = typer.Option(Path("MEMORIES.md"), "--out", help="Markdown file to write."),
+    quotes: bool = typer.Option(
+        False, "--quotes", help="Include the source messages under each memory."
+    ),
+    reclassify: bool = typer.Option(
+        False, "--reclassify", help="Re-file every statement, not just untagged ones."
+    ),
+    batch_size: int = typer.Option(40, "--batch-size", help="Statements per classify call."),
+    config: Path = typer.Option(Path("config.yaml"), "--config"),
+    target: Optional[str] = typer.Option(
+        None, "--target", help="Override config.yaml's target for this run."
+    ),
+    db: Optional[Path] = typer.Option(None, "--db"),
+) -> None:
+    """Write every extracted memory to one markdown document, grouped by topic.
+
+    Files each statement under a fixed topic with one batched LLM call per
+    `--batch-size` statements, then renders. Resumable and cheap to re-run:
+    only statements not yet classified cost anything, so a digest after a new
+    `extract` classifies just the new rows.
+    """
+    cfg = _load_cfg(config, db=db, target=target)
+    if not cfg.target:
+        typer.echo(
+            "Error: no target set. Pass --target or set 'target' in config.yaml.", err=True
+        )
+        raise typer.Exit(code=1)
+    if batch_size < 1:
+        typer.echo("Error: --batch-size must be at least 1.", err=True)
+        raise typer.Exit(code=1)
+
+    conn = store.connect(cfg.db_path)
+    target_person_id = store.resolve_person(conn, cfg.target)
+    if target_person_id is None:
+        typer.echo(
+            f"Error: target {cfg.target!r} was not found. Run `chatmem ingest` first.", err=True
+        )
+        raise typer.Exit(code=1)
+
+    if reclassify:
+        cleared = store.clear_statement_topics(conn, person_id=target_person_id)
+        conn.commit()
+        typer.echo(f"cleared {cleared} existing topic assignments")
+
+    pending = store.list_statements(conn, person_id=target_person_id, untagged=True)
+    if pending:
+        if not cfg.llm.chat_model:
+            typer.echo(
+                f"Error: {len(pending)} statements are not classified yet and "
+                "llm.chat_model is not set in config.yaml.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        llm = LLMClient(cfg.llm)
+        n_failed = 0
+        total_batches = (len(pending) + batch_size - 1) // batch_size
+        for b in range(total_batches):
+            batch = pending[b * batch_size : (b + 1) * batch_size]
+            try:
+                assigned = llm.classify_statements([s.text for s in batch])
+            except LLMResponseError as e:
+                # Left untagged rather than forced into a bucket: they still
+                # render, under Unclassified, and the next run retries them.
+                typer.echo(f"Warning: classify batch {b + 1} failed: {e}")
+                n_failed += len(batch)
+                continue
+            store.set_statement_topics(
+                conn, {s.id: topic for s, topic in zip(batch, assigned) if s.id is not None}
+            )
+            # Commit per batch so an interrupted run keeps what it classified.
+            conn.commit()
+            typer.echo(f"[{b + 1}/{total_batches}] classified {len(batch)} statements")
+        if n_failed:
+            typer.echo(f"{n_failed} statements left unclassified -- re-run to retry them")
+
+    rows = store.list_statements(conn, person_id=target_person_id)
+    if not rows:
+        typer.echo("No statements found. Run `chatmem extract` first.")
+        raise typer.Exit(code=1)
+
+    names = {p.person_id: p.display_name for p in store.all_people(conn)}
+    thread_ids = {s.thread_id for s in rows}
+    quotes_by_statement = None
+    if quotes:
+        quotes_by_statement = {
+            s.id: store.messages_by_ids(conn, s.source_message_ids)
+            for s in rows
+            if s.id is not None
+        }
+
+    meta = digest_render.DigestMeta(
+        title=names.get(target_person_id, target_person_id),
+        generated_at=_now_iso(),
+        message_count=sum(r["message_count"] for r in store.thread_stats(conn)),
+        session_count=len(store.list_sessions(conn)),
+        thread_count=len(thread_ids),
+    )
+    markdown = digest_render.render(
+        meta,
+        rows,
+        show_threads=len(thread_ids) > 1,
+        quotes_by_statement=quotes_by_statement,
+    )
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(markdown, encoding="utf-8")
+
+    buckets = digest_render.group_by_topic(rows)
+    typer.echo(f"wrote {len(rows)} memories in {len(buckets)} sections to {out}")
 
 
 @app.command()

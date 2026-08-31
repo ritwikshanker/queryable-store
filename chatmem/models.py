@@ -94,3 +94,7 @@ class Statement:
     end_ts: str
     created_at: str
     embedding: list[float] | None = None
+    # A chatmem.topics key, assigned by `chatmem digest`, or None until it has
+    # run. Extraction never sets it, so a statement added by a later extract
+    # is picked up by the next digest without re-classifying the rest.
+    topic: str | None = None

@@ -7,9 +7,12 @@ chatmem parses a chat export, normalizes it into sessions, uses a local LLM to e
 statements the chosen participant made about themselves, and lets you query the result
 from the command line with citations back to dates in the archive.
 
-**Everything runs on your machine.** Inference goes to
-[LM Studio](https://lmstudio.ai/)'s OpenAI-compatible server on `localhost`; storage is a
-single SQLite file. No cloud services, no telemetry, nothing is uploaded anywhere.
+**Everything runs where you point it, and by default that is your machine.** Inference
+goes to an OpenAI-compatible server at `llm.base_url` — [LM Studio](https://lmstudio.ai/)
+on `localhost` out of the box; storage is a single SQLite file. No cloud services, no
+telemetry, nothing is uploaded anywhere. Changing `base_url` to a host you do not control
+changes that, deliberately and only when you say so — see
+[Using a remote GPU](#using-a-remote-gpu).
 
 ## Responsibility
 
@@ -45,6 +48,8 @@ chatmem identities                           # see who was found, and how they m
 chatmem stats                                # counts per thread and per person
 chatmem sessions                             # session ranges
 chatmem extract                              # LLM pass: sessions -> statements
+chatmem digest                               # everything, as one markdown document
+chatmem reembed                              # re-embed with a new embedding model
 chatmem query "where has Alex lived?"        # semantic search over those statements
 chatmem statements                           # list what was extracted
 chatmem export --format csv                  # dump statements as JSON or CSV
@@ -58,11 +63,62 @@ chatmem export --format csv                  # dump statements as JSON or CSV
 `extract` is the slow, expensive step: one chat call per session, plus one batched
 embedding call. It is resumable — each session is committed as it finishes, and a re-run
 skips sessions already processed, so an interrupted run picks up where it stopped. Use
-`--force` to redo them anyway (required after changing `llm.embedding_model`, since
-vectors from different models are not comparable).
+`--force` to redo them anyway — after changing `llm.chat_model` or the extraction prompt.
+To change only `llm.embedding_model`, use [`reembed`](#reembed) instead; it skips the
+chat pass entirely.
 
 Statements that restate something already extracted are dropped; tune or disable that
 with `extraction.dedup_threshold` in `config.yaml`.
+
+### reembed
+
+Embedding models improve. `reembed` swaps yours without paying for extraction
+again: it rewrites vectors in place, leaving statement rows, their ids, and their
+topics untouched, so `MEMORIES.md` citations stay valid.
+
+```bash
+chatmem reembed          # after changing llm.embedding_model in config.yaml
+```
+
+`extract --force` would also re-embed, but it redoes the chat pass to produce the
+same statements -- minutes per hundred sessions against seconds. Use `extract
+--force` only when you change `llm.chat_model` or the extraction prompt.
+
+It is whole-database on purpose. Vectors from different models are not
+comparable, so re-embedding part of the store would leave `query` ranking
+against a mix it cannot interpret.
+
+### digest
+
+`query` answers a question you already thought to ask. `digest` is for the ones you
+didn't: it writes every statement to a single markdown document, `MEMORIES.md` by
+default, grouped under a fixed set of topics.
+
+```markdown
+## Places
+
+_Where they live, have lived, have moved to or from, and places they have travelled to
+or want to._
+
+- **2023-04-02** — Moved to Berlin in the spring. `#17`
+- **2023-08-11 – 2023-08-14** — Was travelling around the Baltic coast. `#43`
+```
+
+Its contract is completeness, not relevance: every statement appears exactly once,
+verbatim, with its date and the same id that `chatmem statements` and `chatmem export`
+use. Nothing is summarized or paraphrased. Pass `--quotes` to nest the original messages
+under each line, and `--out` to write somewhere other than `MEMORIES.md`.
+
+The topics are a closed list, defined in `chatmem/topics.py`, so the document stays
+diffable as the archive grows — a memory added next month lands under the heading it
+would have landed under last month. Classification is one batched chat call per
+`--batch-size` (40) statements, stored on the statement, so re-running after a new
+`extract` only costs the new rows and re-rendering costs nothing. Editing the taxonomy
+means re-filing everything: `chatmem digest --reclassify`.
+
+Statements the model fails to classify are left untagged rather than forced into a
+bucket. They still render, under an `Unclassified` heading, and the next run retries
+them.
 
 ### query
 
@@ -111,6 +167,44 @@ existing rows in place — no re-parsing of the archive.
 Aliases match on a normalized display name (case-folded, whitespace-collapsed) across all
 threads. If two genuinely different people share a display name in your archive, that
 name cannot be split apart.
+
+## Using a remote GPU
+
+`extract` is the slow step, and a laptop is a poor place to run it. Any
+OpenAI-compatible server will do, including [Ollama](https://ollama.com/) on a remote
+machine reached through an SSH tunnel:
+
+```bash
+ssh -N -L 11434:127.0.0.1:11434 you@gpu-host
+```
+
+with `llm.base_url: http://localhost:11434/v1`. Extraction is resumable and commits per
+session, so a tunnel that drops mid-run costs one session; add
+`ServerAliveInterval 30` to your SSH config anyway.
+
+Understand what this does and does not protect before pointing it at a machine you do not
+administer. It does protect the data in transit, and it keeps the archive off the remote
+host — only prompt text crosses the tunnel, while the export and `chatmem.db` stay local.
+Never copy the archive to the remote machine; there is no reason to.
+
+It does **not** make you anonymous to that host. Anyone with root there can read your
+process memory and the model's GPU memory, and can turn on request logging. Prompt text
+can reach disk through swap. Your logins are recorded in the host's auth logs. Concretely,
+if you go ahead:
+
+- Run your own server rather than sharing a system one, bound to loopback with debug
+  logging off: `OLLAMA_HOST=127.0.0.1:11434 OLLAMA_DEBUG=0 ollama serve`. A server bound
+  to `0.0.0.0` publishes an unauthenticated LLM API to the whole network.
+- Use the API only. `ollama run` writes an interactive history file to disk; the server
+  path does not persist prompts or responses.
+- `ollama stop <model>` when you are done, so the context does not sit in VRAM.
+
+If the machine belongs to an employer, its acceptable-use policy probably asserts a right
+to inspect anything on it — and the other person in your chat logs is not a party to that
+policy. That is a consent question the tunnel does not answer.
+
+Vectors from different embedding models are not comparable, and the same nominal model can
+differ between runtimes. Switching servers means `chatmem extract --force`.
 
 ## Supported archives
 

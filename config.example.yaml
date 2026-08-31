@@ -25,13 +25,21 @@ target: null
 #     aliases: ["Participant B"]
 identities: []
 
+# Any OpenAI-compatible server. LM Studio serves /v1 on port 1234; Ollama on
+# port 11434. Point base_url at a host you trust -- see "Using a remote GPU" in
+# the README before aiming it anywhere but this machine.
 llm:
   base_url: http://localhost:1234/v1
-  api_key: lm-studio        # dummy value; LM Studio does not check it
-  chat_model: ""             # set to a chat model id served by your LM Studio instance
-  embedding_model: ""        # set to an embedding model id served by your LM Studio instance
+  api_key: lm-studio        # dummy value; neither LM Studio nor Ollama checks it
+  chat_model: ""             # set to a chat model id your server actually serves
+  embedding_model: ""        # set to an embedding model id your server actually serves
   timeout_seconds: 60
   max_retries: 3
+  # Only sent if you set it -- a server that doesn't know the parameter will
+  # reject the request outright. On a reasoning model, "none" is a large win:
+  # extraction and classification are mechanical, and thinking tokens are pure
+  # latency. Measured ~3x faster on qwen3 via Ollama.
+  # reasoning_effort: none
 
 sessionize:
   idle_gap_minutes: 120

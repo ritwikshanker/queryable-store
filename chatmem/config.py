@@ -35,6 +35,12 @@ class LLMConfig:
     embedding_model: str = ""
     timeout_seconds: float = 60.0
     max_retries: int = 3
+    # Passed straight through to the chat endpoint when set. Extraction and
+    # classification are mechanical tasks, so a reasoning model burning tokens
+    # on them is pure latency -- "none" measured ~3x faster on qwen3 via
+    # Ollama. Left None by default because not every server accepts the
+    # parameter at all.
+    reasoning_effort: str | None = None
 
 
 @dataclass(frozen=True)
@@ -131,6 +137,7 @@ def _parse_llm(raw: Any) -> LLMConfig:
         embedding_model=raw.get("embedding_model", defaults.embedding_model),
         timeout_seconds=raw.get("timeout_seconds", defaults.timeout_seconds),
         max_retries=raw.get("max_retries", defaults.max_retries),
+        reasoning_effort=raw.get("reasoning_effort", defaults.reasoning_effort),
     )
 
 

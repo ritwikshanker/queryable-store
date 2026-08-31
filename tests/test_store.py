@@ -161,6 +161,79 @@ def test_connect_migrates_v3_db_packing_embeddings_and_backfilling_extracted_at(
     assert by_id[2].extracted_at is None
 
 
+def test_connect_migrates_v4_db_adding_topic_column_left_null(tmp_path):
+    import sqlite3
+
+    db_path = tmp_path / "chatmem.db"
+    # A Phase-4 (schema_version=4) database: statements exist and are embedded,
+    # but have no topic column.
+    v4_conn = sqlite3.connect(str(db_path))
+    v4_conn.executescript(
+        """
+        CREATE TABLE people (person_id TEXT PRIMARY KEY, display_name TEXT NOT NULL, origin TEXT NOT NULL);
+        CREATE TABLE aliases (alias_norm TEXT PRIMARY KEY, raw_name TEXT NOT NULL, person_id TEXT NOT NULL);
+        CREATE TABLE threads (thread_id TEXT PRIMARY KEY, title TEXT, participants TEXT, source TEXT NOT NULL, ingested_at TEXT NOT NULL);
+        CREATE TABLE messages (id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, sender TEXT NOT NULL, person_id TEXT NOT NULL, timestamp_utc TEXT NOT NULL, timestamp_ms INTEGER NOT NULL, text TEXT, media_type TEXT, seq INTEGER NOT NULL);
+        CREATE TABLE sessions (id INTEGER PRIMARY KEY, thread_id TEXT NOT NULL, start_seq INTEGER NOT NULL, end_seq INTEGER NOT NULL, start_ts TEXT NOT NULL, end_ts TEXT NOT NULL, message_count INTEGER NOT NULL, extracted_at TEXT);
+        CREATE TABLE session_participants (session_id INTEGER NOT NULL, person_id TEXT NOT NULL, PRIMARY KEY (session_id, person_id));
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE statements (id INTEGER PRIMARY KEY, person_id TEXT NOT NULL, session_id INTEGER NOT NULL, thread_id TEXT NOT NULL, text TEXT NOT NULL, source_message_ids TEXT NOT NULL, start_ts TEXT NOT NULL, end_ts TEXT NOT NULL, created_at TEXT NOT NULL, embedding BLOB);
+        INSERT INTO meta (key, value) VALUES ('schema_version', '4');
+        INSERT INTO people (person_id, display_name, origin) VALUES ('pA', 'A', 'auto');
+        INSERT INTO threads (thread_id, title, participants, source, ingested_at) VALUES ('t1', 'T', '[]', 'instagram', '1970-01-01T00:00:00.000000Z');
+        INSERT INTO sessions (id, thread_id, start_seq, end_seq, start_ts, end_ts, message_count, extracted_at)
+            VALUES (1, 't1', 0, 1, '1970-01-01T00:00:00.000000Z', '1970-01-01T00:00:01.000000Z', 2, '2024-05-05T00:00:00.000000Z');
+        INSERT INTO statements (person_id, session_id, thread_id, text, source_message_ids, start_ts, end_ts, created_at, embedding)
+            VALUES ('pA', 1, 't1', 'hi', '[]', '1970-01-01T00:00:00.000000Z', '1970-01-01T00:00:00.000000Z', '2024-05-05T00:00:00.000000Z', NULL);
+        """
+    )
+    v4_conn.commit()
+    v4_conn.close()
+
+    conn = store.connect(db_path)
+    row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+    assert row["value"] == str(store.SCHEMA_VERSION)
+
+    # The statement survived, and is left untagged so the first `digest` run
+    # picks it up without needing --reclassify.
+    stmt = store.list_statements(conn)[0]
+    assert stmt.text == "hi"
+    assert stmt.topic is None
+    assert store.list_statements(conn, untagged=True) == [stmt]
+    # Extraction state is untouched, so `extract` still resumes correctly.
+    assert store.list_sessions(conn)[0].extracted_at == "2024-05-05T00:00:00.000000Z"
+
+
+def test_set_statement_topics_assigns_by_id_and_untagged_filter_shrinks(tmp_path):
+    conn = store.connect(tmp_path / "chatmem.db")
+    _ensure_people(conn, "pA")
+    conn.execute(
+        "INSERT INTO threads (thread_id, title, participants, source, ingested_at) "
+        "VALUES ('t1', 'T', '[]', 'instagram', '1970-01-01T00:00:00.000000Z')"
+    )
+    conn.execute(
+        "INSERT INTO sessions (id, thread_id, start_seq, end_seq, start_ts, end_ts, message_count) "
+        "VALUES (1, 't1', 0, 1, '1970-01-01T00:00:00.000000Z', '1970-01-01T00:00:01.000000Z', 2)"
+    )
+    conn.executemany(
+        "INSERT INTO statements (id, person_id, session_id, thread_id, text, source_message_ids, "
+        "start_ts, end_ts, created_at) VALUES (?, 'pA', 1, 't1', ?, '[]', "
+        "'1970-01-01T00:00:00.000000Z', '1970-01-01T00:00:00.000000Z', '2024-05-05T00:00:00.000000Z')",
+        [(1, "a"), (2, "b")],
+    )
+    conn.commit()
+
+    store.set_statement_topics(conn, {1: "family"})
+    conn.commit()
+    assert {s.id: s.topic for s in store.list_statements(conn)} == {1: "family", 2: None}
+    assert [s.id for s in store.list_statements(conn, untagged=True)] == [2]
+
+    # --reclassify resets everything so a changed taxonomy is applied in full.
+    assert store.clear_statement_topics(conn) == 1
+    conn.commit()
+    assert len(store.list_statements(conn, untagged=True)) == 2
+
+
 def test_pack_unpack_embedding_round_trip():
     vec = [0.5, -0.25, 0.125, 0.0]
     assert store._unpack_embedding(store._pack_embedding(vec)) == vec

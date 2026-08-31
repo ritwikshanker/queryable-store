@@ -120,13 +120,23 @@ def ingest(
             conn, thread.thread_id, thread.title, thread.participants, thread.source, ingested_at
         )
 
+        # The id must not change when a later export prepends older messages,
+        # or every statement citing it is discarded on re-ingest. So the
+        # disambiguator is the message's index among rows identical to it in
+        # this thread -- stable under insertion -- not its position in the
+        # thread, which shifts.
+        duplicate_index: dict[tuple, int] = defaultdict(int)
+
         normalized: list[Message] = []
         for seq, raw in enumerate(thread.messages):
             person_id = resolver.resolve(raw.sender)
+            identity = (raw.timestamp_ms, raw.sender, raw.text, raw.media_type)
+            ordinal = duplicate_index[identity]
+            duplicate_index[identity] += 1
             normalized.append(
                 Message(
                     id=_message_id(
-                        thread.thread_id, raw.timestamp_ms, raw.sender, raw.text, raw.media_type, raw.ordinal
+                        thread.thread_id, raw.timestamp_ms, raw.sender, raw.text, raw.media_type, ordinal
                     ),
                     thread_id=thread.thread_id,
                     sender=raw.sender,

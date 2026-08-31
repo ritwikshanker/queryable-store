@@ -1,4 +1,5 @@
 import hashlib
+import shutil
 from pathlib import Path
 
 import pytest
@@ -848,6 +849,82 @@ def test_digest_command_rejects_a_zero_batch_size(
     )
     assert result.exit_code == 1
     assert "--batch-size" in result.output
+
+
+# --- incremental re-ingest -------------------------------------------------
+
+
+def test_reingest_with_a_prepended_older_file_preserves_extraction(
+    tmp_path, extract_config_path, monkeypatch
+):
+    """Instagram splits an export so message_2.json holds OLDER messages. A
+    fuller re-export therefore prepends history, shifting every seq in the
+    thread. Extraction of the untouched later conversation must survive that,
+    or every re-export costs a full re-extract of the whole archive."""
+    monkeypatch.setattr(cli, "LLMClient", _FakeLLM)
+    db_path = tmp_path / "chatmem.db"
+    inbox = tmp_path / "inbox" / "thread_alpha"
+    inbox.mkdir(parents=True)
+    src = Path("tests/fixtures/synthetic_archive/thread_alpha")
+    shutil.copy(src / "message_1.json", inbox)
+
+    args = ["--config", str(extract_config_path), "--db", str(db_path)]
+    runner.invoke(app, ["ingest", str(tmp_path / "inbox")] + args)
+    runner.invoke(app, ["extract"] + args)
+
+    conn = store.connect(db_path)
+    before = store.list_statements(conn, thread_id="thread_alpha")
+    assert before, "extract should have produced statements to preserve"
+    conn.close()
+
+    # The fuller export arrives, adding strictly older messages.
+    shutil.copy(src / "message_2.json", inbox)
+    result = runner.invoke(app, ["ingest", str(tmp_path / "inbox")] + args)
+    assert result.exit_code == 0, result.output
+
+    conn = store.connect(db_path)
+    after = store.list_statements(conn, thread_id="thread_alpha")
+    sessions = store.list_sessions(conn, "thread_alpha")
+
+    # Sessions the prepend did not touch keep their extraction. The session at
+    # the join legitimately changes -- the prepended history is close enough in
+    # time to merge into it -- so it is correctly queued for re-extraction, and
+    # a full preserve is not the contract here.
+    assert after, "seq shifts alone must not discard extraction"
+    assert {s.text for s in after} <= {s.text for s in before}
+    assert "statements preserved:" in result.output
+    assert any(s.extracted_at is not None for s in sessions)
+    assert any(s.extracted_at is None for s in sessions)
+
+
+def test_message_ids_are_stable_when_older_history_is_prepended(
+    tmp_path, extract_config_path, monkeypatch
+):
+    """The id is what statements cite, so it must not depend on a message's
+    position in the thread -- only on the message itself."""
+    monkeypatch.setattr(cli, "LLMClient", _FakeLLM)
+    db_path = tmp_path / "chatmem.db"
+    inbox = tmp_path / "inbox" / "thread_alpha"
+    inbox.mkdir(parents=True)
+    src = Path("tests/fixtures/synthetic_archive/thread_alpha")
+    shutil.copy(src / "message_1.json", inbox)
+    args = ["--config", str(extract_config_path), "--db", str(db_path)]
+
+    runner.invoke(app, ["ingest", str(tmp_path / "inbox")] + args)
+    conn = store.connect(db_path)
+    before = {m.id: m.timestamp_ms for m in store.thread_messages(conn, "thread_alpha")}
+    conn.close()
+
+    shutil.copy(src / "message_2.json", inbox)
+    runner.invoke(app, ["ingest", str(tmp_path / "inbox")] + args)
+    conn = store.connect(db_path)
+    after = {m.id: m.timestamp_ms for m in store.thread_messages(conn, "thread_alpha")}
+
+    # Every previously-seen message kept its id, despite its seq changing.
+    assert set(before) <= set(after)
+    # And the seqs really did shift, or this test proves nothing.
+    seqs = {m.id: m.seq for m in store.thread_messages(conn, "thread_alpha")}
+    assert any(seqs[mid] != i for i, mid in enumerate(before))
 
 
 # --- reembed ---------------------------------------------------------------

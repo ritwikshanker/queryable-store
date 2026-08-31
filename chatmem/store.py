@@ -518,20 +518,25 @@ def replace_thread_content(
 
     Extraction is the expensive part of the pipeline, so re-ingesting an
     archive that hasn't changed must not throw its output away. A session is
-    considered the same session if its range, bounds and size all match and
-    every message its statements cite still exists -- message ids are content
+    considered the same session if its time bounds and size match and every
+    message its statements cite still exists -- message ids are content
     hashes, so any edit to the cited text breaks the match and the session is
     left unextracted for `chatmem extract` to redo.
+
+    Deliberately keyed on timestamps rather than start_seq/end_seq: a fuller
+    re-export prepends older messages, which shifts every seq in the thread
+    while leaving the later conversation untouched. Matching on seq would
+    call every one of those sessions new and re-extract the entire archive.
 
     Returns the saved sessions and how many statements were carried over.
     """
     old_sessions = {
-        (r["start_seq"], r["end_seq"], r["start_ts"], r["end_ts"], r["message_count"]): (
+        (r["start_ts"], r["end_ts"], r["message_count"]): (
             r["id"],
             r["extracted_at"],
         )
         for r in conn.execute(
-            "SELECT id, start_seq, end_seq, start_ts, end_ts, message_count, extracted_at "
+            "SELECT id, start_ts, end_ts, message_count, extracted_at "
             "FROM sessions WHERE thread_id = ?",
             (thread_id,),
         ).fetchall()
@@ -546,13 +551,7 @@ def replace_thread_content(
     live_ids = {m.id for m in messages}
     preserved = 0
     for session in saved:
-        key = (
-            session.start_seq,
-            session.end_seq,
-            session.start_ts,
-            session.end_ts,
-            session.message_count,
-        )
+        key = (session.start_ts, session.end_ts, session.message_count)
         match = old_sessions.get(key)
         if match is None:
             continue

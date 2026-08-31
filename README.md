@@ -231,6 +231,14 @@ extracted for a session survive the rebuild as long as that session's messages h
 changed — so re-ingesting doesn't throw away LLM work. If a session's messages did
 change, its statements are dropped and it is queued for re-extraction.
 
+This holds for a *fuller* re-export too, not just an identical one. Instagram splits a
+thread so that `message_2.json` holds older messages than `message_1.json`, so exporting
+again after the conversation has grown prepends history and shifts every message's
+position in the thread. Message ids are derived from the message itself rather than its
+position, and sessions are matched on their time bounds rather than their offsets, so
+only the sessions whose contents actually changed — typically just the one at the join —
+are re-extracted. Everything already done is kept.
+
 The schema migrates itself forward on connect. Back up `data/chatmem.db` before the first
 run after an upgrade.
 

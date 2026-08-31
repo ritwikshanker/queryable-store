@@ -20,7 +20,7 @@ class RawMessage:
     timestamp_ms: int
     text: str | None
     media_type: str | None
-    ordinal: int  # position within the raw parse order; disambiguates ties
+    ordinal: int  # position within the raw parse order; orders same-timestamp rows
 
 
 @dataclass(frozen=True)

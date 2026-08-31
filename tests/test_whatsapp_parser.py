@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from chatmem.parsers.whatsapp import WhatsAppParser
+from chatmem.parsers.whatsapp import WhatsAppParser, _slug
 
 ANDROID = """\
 12/05/2023, 9:41 AM - Messages and calls are end-to-end encrypted.
@@ -165,3 +165,26 @@ def test_24_hour_times_are_supported(tmp_path):
     path = _write(tmp_path, "chat.txt", body)
     [thread] = list(WhatsAppParser().parse(path))
     assert thread.messages[0].timestamp_ms == _ts(2023, 5, 12, 21, 41)
+
+
+def test_slug_keeps_non_latin_chat_names_distinct():
+    """A name in a non-Latin script reduces to the boilerplate around it --
+    "WhatsApp Chat with <Devanagari>" collapses to "whatsapp_chat_with" -- so
+    every such export would land on one thread id and silently replace the
+    previous thread on ingest."""
+    a = _slug("WhatsApp Chat with \u0905\u0923\u093f\u092e\u093e\u0902")
+    b = _slug("WhatsApp Chat with \uc544\ub2c8\ub9c8")
+    assert a != b
+    assert a.startswith("whatsapp_chat_with_")
+    assert a == _slug("WhatsApp Chat with \u0905\u0923\u093f\u092e\u093e\u0902")
+    assert a.isascii(), "ids get typed at a shell for --thread"
+
+
+def test_slug_leaves_ascii_names_readable():
+    """The digest is only for names that would otherwise be lost; an ASCII
+    name must keep the plain, guessable id it already had."""
+    assert _slug("WhatsApp Chat with Alex") == "whatsapp_chat_with_alex"
+    # Separators are noise in both forms, so dropping them is not information
+    # loss and must not trigger a digest.
+    assert _slug("_Chat_") == "chat"
+    assert _slug("") == "whatsapp_thread"

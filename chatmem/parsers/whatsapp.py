@@ -15,6 +15,7 @@ looks at gaps between messages in the same thread.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections import Counter
 from datetime import datetime, timezone
@@ -134,7 +135,22 @@ def _to_timestamp_ms(parts: tuple[int, int, int], time: tuple[int, int, int], da
 
 
 def _slug(value: str) -> str:
+    """Derive a thread id from the export's filename.
+
+    The id stays ASCII so it can be typed at a shell for --thread, but a name
+    written in a non-Latin script would otherwise reduce to the boilerplate
+    around it -- "WhatsApp Chat with <Devanagari name>" collapses to
+    "whatsapp_chat_with" -- and every such export would land on that same id,
+    silently replacing the previous thread on ingest. When characters are lost,
+    a short digest of the original keeps distinct chats distinct.
+    """
     slug = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+    # Only letters and digits carry the name; separators and punctuation are
+    # noise either way, so losing them is not what makes an id ambiguous.
+    lost_alphanumerics = sum(1 for c in value if c.isalnum() and not c.isascii())
+    if lost_alphanumerics:
+        digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+        slug = f"{slug}_{digest}" if slug else f"whatsapp_thread_{digest}"
     return slug or "whatsapp_thread"
 
 

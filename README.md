@@ -68,7 +68,9 @@ To change only `llm.embedding_model`, use [`reembed`](#reembed) instead; it skip
 chat pass entirely.
 
 Statements that restate something already extracted are dropped; tune or disable that
-with `extraction.dedup_threshold` in `config.yaml`.
+with `extraction.dedup_threshold` in `config.yaml`. Sessions the run is about to rebuild
+are excluded from that comparison, so `--force` rebuilds a session rather than deduping
+its new statements against the copies it is replacing.
 
 ### reembed
 

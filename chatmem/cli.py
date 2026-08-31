@@ -500,15 +500,29 @@ def extract(
     target_name = display_name_by_person.get(target_person_id, target_person_id)
 
     participants_by_session = store.participants_by_session(conn)
-    # Dedup compares against what the target already has stored; kept
-    # statements are appended as sessions complete.
+    sessions = store.list_sessions(conn, thread_id=thread)
+
+    # Sessions this run will rebuild. Their current statements are about to be
+    # deleted, so they must not seed the dedup set: on --force every session is
+    # in here, and seeding from them would make each re-extracted statement a
+    # near-duplicate of the copy it is replacing and drop it, emptying the
+    # store instead of rebuilding it.
+    pending_session_ids = {
+        session.id
+        for session in sessions
+        if target_person_id in participants_by_session.get(session.id, set())
+        and (force or session.extracted_at is None)
+    }
+
+    # Dedup compares against what the target already has stored and is keeping;
+    # newly kept statements are appended as sessions complete.
     seen_embeddings = (
         []
         if drop_existing_embeddings
         else [
             s.embedding
             for s in store.list_statements(conn, person_id=target_person_id)
-            if s.embedding is not None
+            if s.embedding is not None and s.session_id not in pending_session_ids
         ]
     )
 
@@ -519,7 +533,6 @@ def extract(
     n_processed = 0
     n_deduped = 0
 
-    sessions = store.list_sessions(conn, thread_id=thread)
     total = len(sessions)
     interrupted = False
 

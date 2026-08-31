@@ -1018,3 +1018,50 @@ def test_reembed_errors_when_nothing_has_been_extracted(tmp_path, extract_config
     )
     assert result.exit_code == 1
     assert "Run `chatmem extract` first" in result.output
+
+
+def test_extract_force_rebuilds_instead_of_deduping_against_its_own_output(
+    tmp_path, synthetic_archive, extract_config_path, monkeypatch
+):
+    """--force deletes and rebuilds each session's statements. Seeding the
+    dedup set from those same statements made every re-extracted statement a
+    near-duplicate of the copy it was replacing, so --force emptied the store
+    instead of rebuilding it."""
+    monkeypatch.setattr(cli, "LLMClient", _FakeLLM)
+    db_path = tmp_path / "chatmem.db"
+    args = ["--config", str(extract_config_path), "--db", str(db_path)]
+    runner.invoke(app, ["ingest", str(synthetic_archive)] + args)
+    runner.invoke(app, ["extract"] + args)
+
+    before = store.list_statements(store.connect(db_path), person_id="target")
+    assert before, "extract should have produced statements to rebuild"
+
+    result = runner.invoke(app, ["extract", "--force"] + args)
+    assert result.exit_code == 0, result.output
+    after = store.list_statements(store.connect(db_path), person_id="target")
+    assert [s.text for s in after] == [s.text for s in before]
+    assert "0 extracted" not in result.output
+
+
+def test_extract_still_dedups_against_sessions_it_is_not_rebuilding(
+    tmp_path, synthetic_archive, extract_config_path, monkeypatch
+):
+    """The narrowed dedup set must not disable dedup itself: a resumed run
+    still compares new statements against the sessions already done."""
+    monkeypatch.setattr(cli, "LLMClient", _SameStatementLLM)
+    db_path = tmp_path / "chatmem.db"
+    args = ["--config", str(extract_config_path), "--db", str(db_path)]
+    runner.invoke(app, ["ingest", str(synthetic_archive)] + args)
+    result = runner.invoke(app, ["extract"] + args)
+    assert result.exit_code == 0, result.output
+
+    # Every session yields the identical statement, so exactly one survives.
+    kept = store.list_statements(store.connect(db_path), person_id="target")
+    assert len(kept) == 1, f"expected dedup to collapse these, got {len(kept)}"
+
+
+class _SameStatementLLM(_FakeLLM):
+    """Returns the same statement for every session, so dedup must collapse."""
+
+    def extract_statements(self, transcript, target_name):
+        return [{"text": "the very same fact every time", "message_indices": [0]}]

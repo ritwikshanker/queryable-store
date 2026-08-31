@@ -139,6 +139,35 @@ and `--limit`. By default the command returns ranked statements, not prose; pass
 `--answer` to also have the chat model compose an answer from the top results, citing
 them by the same numbers.
 
+## Updating later
+
+Every step is incremental, so a later export costs roughly what actually changed
+rather than what the archive contains. Export again over the same thread
+directories and run the same three commands:
+
+```bash
+chatmem ingest path/to/messages/inbox --source instagram
+chatmem extract
+chatmem digest
+```
+
+- `ingest` rebuilds each thread, but message ids are derived from the message
+  rather than its position, and sessions are matched on their time bounds, so
+  statements for sessions whose contents did not change are carried over.
+- `extract` skips sessions marked extracted, so it processes only the new
+  conversation — and the session at the join, if the new export merged into it.
+- `digest` classifies only statements with no topic yet, and re-renders the
+  whole document from what is stored.
+
+The exception is a change to `llm.chat_model` or the extraction prompt, which
+invalidates the statements themselves rather than the sessions: that needs
+`chatmem extract --force`. A change to `llm.embedding_model` alone needs only
+[`reembed`](#reembed).
+
+Pass `--source` explicitly when the export folder contains media subdirectories,
+or parser auto-detection may find the directory ambiguous and stop rather than
+guess.
+
 ## Identities: one person, several accounts
 
 The same person may appear under different display names — a second account, a renamed

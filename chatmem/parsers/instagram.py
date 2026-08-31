@@ -133,16 +133,20 @@ def _classify(raw: dict[str, Any]) -> tuple[str | None, str | None, str | None]:
     """Return (drop_reason, text, media_type); drop_reason is None if kept."""
     raw_content = raw.get("content")
     content = fix_mojibake(raw_content) if isinstance(raw_content, str) else None
+    # Generated phrases arrive with trailing whitespace in real exports
+    # ("Reacted <emoji> to your message "), so the anchored patterns below are
+    # matched against a stripped copy. The message keeps its original text.
+    probe = content.strip() if content else None
 
     if raw.get("is_unsent"):
         return "unsent", None, None
 
     if raw.get("call_duration") is not None:
         return "call", None, None
-    if content and any(p.match(content) for p in _CALL_PATTERNS):
+    if probe and any(p.match(probe) for p in _CALL_PATTERNS):
         return "call", None, None
 
-    if content and any(p.match(content) for p in _REACTION_PATTERNS):
+    if probe and any(p.match(probe) for p in _REACTION_PATTERNS):
         return "reaction", None, None
 
     media_type = _detect_media_type(raw)

@@ -243,3 +243,26 @@ def test_messages_without_usable_timestamps_are_dropped_not_dated_to_1970(tmp_pa
     # are reported rather than silently sorted to 1970.
     assert [m.text for m in thread.messages] == ["real"]
     assert thread.dropped["missing_timestamp"] == 3
+
+
+def test_reaction_and_call_rows_with_surrounding_whitespace_are_dropped(tmp_path):
+    """Real exports emit "Reacted <emoji> to your message " with a trailing
+    space. An anchored pattern that is not whitespace-tolerant lets thousands
+    of these through as if they were real messages -- 994 of them in a single
+    real archive."""
+    thread = tmp_path / "t1"
+    _write(
+        thread,
+        "message_1.json",
+        ["A", "B"],
+        [
+            {"sender_name": "A", "timestamp_ms": 4, "content": "Reacted \u00f0\u009f\u0098\u0082 to your message "},
+            {"sender_name": "A", "timestamp_ms": 3, "content": "Liked a message  "},
+            {"sender_name": "B", "timestamp_ms": 2, "content": "  Missed a video call "},
+            {"sender_name": "B", "timestamp_ms": 1, "content": "a real message"},
+        ],
+    )
+    parsed = list(InstagramParser().parse(thread))[0]
+    assert [m.text for m in parsed.messages] == ["a real message"]
+    assert parsed.dropped["reaction"] == 2
+    assert parsed.dropped["call"] == 1

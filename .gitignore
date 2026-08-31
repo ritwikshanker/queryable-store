@@ -173,6 +173,11 @@ data/
 /*.json
 config.yaml
 
+# `chatmem digest` renders every extracted statement to markdown. That is the
+# most readable copy of the archive that exists -- it must never be committed.
+MEMORIES.md
+*.memories.md
+
 # Export archives, and the directories they unpack into.
 *.zip
 *.tar.gz
